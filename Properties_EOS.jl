@@ -75,14 +75,21 @@ function density(compound, CES)
 
     # Preallocate the density matrix
     Phi_PR = zeros(Float64, length(T), length(P))
-
+    v0 = nothing
     for t in T
+        (pv, vl, vv) = saturation_pressure(model, t; v0=v0)
+        v0 = (vl, vv)
+            
         for pr in P
+            if pr>pv
+                ph=liquid
+            else
+                ph=vapor
+            density_value = 1/volume(model, pr, t; phase=:ph)
 
-            density_value = 1/volume(model, pr, t)
             if isnan(density_value)
                 handle.update(CoolProp_.PT_INPUTS, pr, t)
-                density_value = 1/volume(model, pr, t, vol0=1/handle.rhomolar())
+                density_value = 1/volume(model, pr, t; vol0=1/handle.rhomolar(); phase=:ph)
             end
             Phi_PR[T .== t, P .== pr] .= density_value
 
