@@ -76,18 +76,37 @@ function density_CES(compound, CES; T_shift = 0.0)
 
     v0 = nothing
     pv = nothing
+    handle.update(CoolProp.QT_INPUTS, 0, T[1])
+    vl0 = 1 / handle.rhomolar()
+    pv0 = handle.p()
+
+    handle.update(CoolProp.QT_INPUTS, 1, T[1])
+    vv0 = 1 / handle.rhomolar()
+    
+    v0 = (vl0, vv0)
 
     # From CES
     (Tc, pc, vc) = crit_pure(model)
 
     for t in T
         if t in Tsat
-            if t == T[1]
-                (pv, vl, vv) = saturation_pressure(model, t)
-            else
-                (pv, vl, vv) = saturation_pressure(model, t, IsoFugacitySaturation(p0 = pv, vl = v0[2], vv = v0[1]))
-            end
             
+            (pv, vl, vv) = saturation_pressure(model, t)
+            
+            if isnan(pv)
+                (pv, vl, vv) = saturation_pressure(model, t, IsoFugacitySaturation(p0 = pv, vl = v0[2], vv = v0[1]))
+                if isnan(pv)
+                    handle.update(CoolProp.QT_INPUTS, 0, t)
+                    vl0 = 1 / handle.rhomolar()
+                    pv0 = handle.p()
+
+                    handle.update(CoolProp.QT_INPUTS, 1, t)
+                    vv0 = 1 / handle.rhomolar()
+
+                    (pv, vl, vv) = saturation_pressure(model, t, v0=(vl0,vv0))
+                end
+            end
+           
             if vl > vv
                 vl, vv = vv, vl
             end
@@ -95,11 +114,14 @@ function density_CES(compound, CES; T_shift = 0.0)
             if isnan(pv)
                 handle.update(CoolProp.QT_INPUTS, 0, t)
                 vl0 = 1 / handle.rhomolar()
+                pv0 = handle.p()
 
                 handle.update(CoolProp.QT_INPUTS, 1, t)
                 vv0 = 1 / handle.rhomolar()
 
-                (pv, vl, vv) = saturation_pressure(model, t, v0=(vl0,vv0))
+
+                (pv, vl, vv) = saturation_pressure(model, t, ChemPotVSaturation(p0 = pv0, vl = vl0, vv = vv0))
+                
             end
             
             hl = Clapeyron.VT_enthalpy(model, vl, t, [1.])
@@ -114,11 +136,14 @@ function density_CES(compound, CES; T_shift = 0.0)
             Sres_sat_vap_CES[t.==Tsat] .= Clapeyron.VT_entropy_res(model, vv, t, [1.])
             Hv_CES[t.==Tsat] .= hv - hl
             pv_CES[t.==Tsat] .= pv
+
+            handle.update(CoolProp.QT_INPUTS, 0, t)
+            pv_CP = CoolProp.CoolProp.AbstractState.p(handle)
         end
 
         for pr in P
             if pr < pc && t < Tc
-                if pr < pv
+                if pr < pv_CP
                     density_value = 1 / volume(model, pr, t; phase = :vapor)
                     fugacity_value = fugacity_coefficient(model, pr, t; phase = :vapor)[1]
                 else
