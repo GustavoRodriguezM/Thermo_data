@@ -8,6 +8,9 @@ from sklearn.cluster import AffinityPropagation
 from sklearn.preprocessing import RobustScaler
 from matplotlib.patches import Ellipse
 from sklearn.decomposition import PCA
+from bisect import bisect_left
+import matplotlib.pyplot as plt
+from pathlib import Path
 import matplotlib.pyplot as plt
 import math
 from scipy.io import loadmat
@@ -18,6 +21,7 @@ import plotly.graph_objects as go
 import sys
 from r_pca import R_pca
 from sklearn.cluster import DBSCAN
+from scipy.interpolate import griddata
 import hdbscan
 from sklearn.cluster import KMeans
 from sklearn.cluster import MeanShift
@@ -27,28 +31,15 @@ import time
 import plotly.express as px
 from sklearn.metrics import silhouette_score
 import itertools
+from scipy.optimize import curve_fit
 
 # Define the base directory for PCA results
 base_dir = '/work/vt2/cgr7735/Fugacity_project/PCA results'
-
+excluded = pd.DataFrame()
+excluded_char = pd.DataFrame()
 def ensure_dir_exists(path):
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
-
-
-def get_next_attempt_dir(base_path):
-    # Ensure the base path exists
-    ensure_dir_exists(base_path)
-    
-    # Check existing attempt directories
-    attempt_dirs = [d for d in os.listdir(base_path) if d.startswith('attempt')]
-    if not attempt_dirs:
-        return os.path.join(base_path, 'attempt 1')
-
-    # Determine the highest attempt number and add 1
-    attempt_numbers = [int(d.split()[1]) for d in attempt_dirs]
-    next_attempt_number = max(attempt_numbers) + 1
-    return os.path.join(base_path, f'attempt {next_attempt_number}')
 
 with open('dipoles and polarizability.json', 'r') as file:
     data_auxiliary = json.load(file)
@@ -68,7 +59,7 @@ CES = ['cPR','ADPCSAFT', 'BACKSAFT', 'Berthelot', 'CKSAFT', 'Clausius', 'CPA', '
        'SAFTVRSMie', 'SAFTVRSW', 'sCKSAFT','sCPA', 'softSAFT2016','sPCSAFT', 'SRK', 
        'structSAFTgammaMie', 'tcPR', 'tcRK', 'TVTPR', 'gcsPCSAFT','TWUSRK', 'UMRPR', 'vdW', 'VTPR'] 
 
-subs = compounds =  SUBSSS =  set(['n-Nonane', 'MethylLinolenate', 'DimethylCarbonate', 'R21', 'DiethylEther', 'trans-2-Butene', 'R245fa', 'Isohexane', 'R365MFC', 'n-Dodecane', 'D4', 'R13', 'MD2M', 'n-Hexane', 'Methane', 'Ethane', 'CarbonylSulfide', 'EthylBenzene', 'CarbonMonoxide', 'Isopentane', 'Xenon', 'cis-2-Butene', 'R152A', 'Oxygen', 'EthyleneOxide', 'R1234ze(E)', 'n-Octane', 'R236EA', 'CycloHexane', 'n-Heptane', 'R22', 'R113', 'n-Pentane', 'MethylLinoleate', 'R11', 'SulfurDioxide', 'R23', 'Helium', 'R32', 'R227EA', 'HydrogenSulfide', 'R245ca', 'Novec649', 'R143a', 'D5', 'R134a', 'Dichloroethane', 'R1233zd(E)', 'Acetone', 'n-Decane', 'MethylPalmitate', 'n-Propane', 'R115', 'R1234yf', 'R236FA', 'Ethylene', 'R116', 'MD4M', 'Benzene', 'Methanol', 'SulfurHexafluoride', 'o-Xylene', 'R125', 'Fluorine', 'R1234ze(Z)', 'CarbonDioxide', 'IsoButane', 'n-Butane', 'NitrousOxide', 'DimethylEther', 'RC318', 'Toluene', 'IsoButene', 'MethylStearate', 'Ammonia', 'Argon', 'R218', 'R41', 'Neon', 'Propyne', 'CycloPropane', 'R12', 'Nitrogen', 'Water', 'MethylOleate', 'R161', 'D6', 'HFE143m', 'n-Undecane', 'R123', 'HydrogenChloride', 'm-Xylene', 'R141b','R124', '1-Butene', 'Propylene', 'R14', 'p-Xylene', 'Cyclopentane', 'MDM', 'Hydrogen', 'Neopentane', 'Ethanol', 'R114', 'Krypton', 'MD3M', 'R1243zf', 'MM', 'R142b', 'R40', 'R13I1', 'cis-2-Butene'])-set(["DimethylCarbonate", "MethylOleate"])
+subs = compounds =  SUBSSS = ["Acetone",'Cyclopentane','n-Nonane',  'MethylLinolenate', 'DimethylCarbonate', 'R21', 'DiethylEther', 'trans-2-Butene', 'R245fa', 'Isohexane', 'R365MFC', 'n-Dodecane', 'D4', 'R13', 'MD2M', 'n-Hexane', 'Methane', 'Ethane', 'CarbonylSulfide', 'EthylBenzene', 'CarbonMonoxide', 'Isopentane', 'Xenon', 'cis-2-Butene', 'R152A', 'Oxygen', 'EthyleneOxide', 'R1234ze(E)', 'n-Octane', 'R236EA', 'CycloHexane', 'n-Heptane', 'R22', 'R113', 'n-Pentane', 'MethylLinoleate', 'R11', 'SulfurDioxide', 'R23', 'Helium', 'R32', 'R227EA', 'HydrogenSulfide', 'R245ca', 'Novec649', 'R143a', 'D5', 'R134a', 'Dichloroethane', 'R1233zd(E)', 'Acetone', 'n-Decane', 'MethylPalmitate', 'n-Propane', 'R115', 'R1234yf', 'R236FA', 'Ethylene', 'R116', 'MD4M', 'Benzene', 'Methanol', 'SulfurHexafluoride', 'o-Xylene', 'R125', 'Fluorine', 'R1234ze(Z)', 'CarbonDioxide', 'IsoButane', 'n-Butane', 'NitrousOxide', 'DimethylEther', 'RC318', 'Toluene', 'IsoButene', 'MethylStearate', 'Ammonia', 'Argon', 'R218', 'R41', 'Neon', 'Propyne', 'CycloPropane', 'R12', 'Nitrogen', 'Water', 'MethylOleate', 'R161', 'D6', 'HFE143m', 'n-Undecane', 'R123', 'HydrogenChloride', 'm-Xylene', 'R141b','R124', '1-Butene', 'Propylene', 'R14', 'p-Xylene', 'MDM', 'Hydrogen', 'Neopentane', 'Ethanol', 'R114', 'Krypton', 'MD3M', 'R1243zf', 'MM', 'R142b', 'R40', 'R13I1', 'cis-2-Butene', "DimethylCarbonate", "MethylOleate"]
 
 regions = ["supercritical liquid", "supercritical gas", "supercritical", "liquid", "gas", "Saturated liquid", "Saturated vapor"]
 properties = ["fugacity","density","residual entropy","Hv", "vp", "MolecularMass", "AcentricFactor","polarizability","dipole","n_H","n_e", "sigma_moments 1", "sigma_moments 2", "sigma_moments 3", "sigma_moments 4", "sigma_moments 5", "sigma_moments 6"]
@@ -91,32 +82,10 @@ for prop in properties:
 
 Missing_files = []
 
-def outlier_detector(PC_matrix,pca_data,loadings):
-    compounds = PC_matrix.index
-    PC_values = np.array(pca_data)
-    outliers = pd.DataFrame()  
-    Compounds= set()
-    for i in range(0,PC_values.shape[1]):
-        Analysed = PC_values[:,i]
-        outli = np.where(Analysed > 3)
-        if not outli:
-            continue
-        elif isinstance(outli, int):
-            outli = [outli]
-        else:
-            outli = outli[0].tolist()
-
-        for index in outli:
-            Compounds.add(compounds[index])
-            for row in loadings.index.tolist():
-                outliers.at[compounds[index], row] = loadings.loc[row, f"PC{i+1}"]
-            
-
-    return outliers, Compounds
 
 
 def plot_error_distribution(errors,prop,path,title, bins=50):
-    errors = np.array(errors).flatten()
+    errors = np.array(errors[np.isfinite(errors)]).flatten()
     counts, bin_edges = np.histogram(errors, bins=bins)
     bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
     plt.figure(figsize=(8, 5))
@@ -210,29 +179,6 @@ def plotly_distance_biplot(pca_data, loadings, df, comp_x=0, comp_y=1, scale_arr
 
     fig.write_html(output_file)
 
-def update_excluded_log(EOS, excluded_compounds):
-    log_file = 'excluded_compounds_log.xlsx'
-
-    # Check if the log file already exists
-    if os.path.exists(log_file):
-        excluded_log_df = pd.read_excel(log_file, index_col=0)
-    else:
-        excluded_log_df = pd.DataFrame()
-
-    # Create a DataFrame with the excluded compounds
-    excluded_df = pd.DataFrame({EOS: list(excluded_compounds)}, index=range(len(excluded_compounds)))
-
-    # Concatenate and remove duplicate columns only if there are existing columns
-    if not excluded_log_df.empty:
-        temp_df = pd.concat([excluded_log_df, excluded_df], axis=1)
-        excluded_log_df = temp_df.loc[:, ~temp_df.columns.duplicated()]
-    else:
-        excluded_log_df = excluded_df
-
-    # Save the updated log
-    excluded_log_df.to_excel(log_file)
-
-
 def file_loader(Equation, Substance, Property):
     Equation_1 = [Equation.capitalize() if Equation=="CoolProp" else Equation][0]
     file_name = f"{Equation_1} {Substance} {Property}.mat"
@@ -243,7 +189,9 @@ def file_loader(Equation, Substance, Property):
         Missing_files.append([Equation, Substance, Property])
     return Result
 
-def Error_spliter(Matrix, vp_CES, vp_CP, N, T, P, Tc_CP, Pc_CP,Tc_CES, Pc_CES, Tsat_CP,Tsat_CES):
+
+
+def Error_spliter______(Matrix, vp_CES, vp_CP, N, T, P, Tc_CP, Pc_CP,Tc_CES, Pc_CES, Tsat_CP,Tsat_CES):
     Pc_CP_ind, Tc_CP_ind = bisect(P, Pc_CP), bisect(T, Tc_CP)
     Pc_CES_ind, Tc_CES_ind = bisect(P, Pc_CES), bisect(T, Tc_CES)
     vp_CES_index = [bisect(P, i) for i in vp_CES]
@@ -255,8 +203,6 @@ def Error_spliter(Matrix, vp_CES, vp_CP, N, T, P, Tc_CP, Pc_CP,Tc_CES, Pc_CES, T
     Error_rest_liquid = np.array([])
     Error_rest_gas = np.array([])
 
-
-    
     if Tc_CP>Tc_CES:
         for vp_CES_ind, vp_CP_ind, T_CES in zip(vp_CES_index, vp_CP_index,Tsat_CES):  
             
@@ -285,7 +231,234 @@ def Error_spliter(Matrix, vp_CES, vp_CP, N, T, P, Tc_CP, Pc_CP,Tc_CES, Pc_CES, T
     }
     return regions
 
+
+def rho_liquid(T, Tc, rho_c, param_values):
+    tau = 1 - T / Tc
+    params = np.concatenate([np.array(param_values), np.zeros(4 - len(param_values))])
+    ln_rho = (params[0] * tau**(2/6) + params[1] * tau**(3/6) + 
+              params[2] * tau**(7/6) + params[3] * tau**(9/6))
+    return rho_c * np.exp(ln_rho)
+
+def rho_altern(T, Tc, rho_c, param_values):
+    params = np.concatenate([np.array(param_values), np.zeros(4 - len(param_values))])
+    rho = rho_c * np.abs(params[0]) ** (-(np.abs(1 - T / Tc)) ** params[1])
+    return rho
+
+def rho_vapor(T, Tc, rho_c, param_values):
+    tau = 1 - T / Tc
+    params = np.concatenate([np.array(param_values), np.zeros(5 - len(param_values))])
+    ln_rho = (params[0] * tau**(2/6) + params[1] * tau**(4/6) + 
+              params[2] * tau**(7/6) + params[3] * tau**(13/6) + 
+              params[4] * tau**(25/6))
+    return rho_c * np.exp(ln_rho)
+
+
+
+def adjuster(x, y, fun, N):
+    params = np.array([])
+    AAD = 10000000
+    
+    for num_param in range(1, N + 1):
+        guess = np.ones(num_param)
+        if len(params) > 0:
+            guess[:len(params)] = params
+        
+        try:
+            popt, pcov = curve_fit(fun, x, y, p0=guess, maxfev=10000)
+            params = popt
+            pred = fun(x, *params)
+            AAD = np.sum(np.abs(pred - y)) / len(y)
+        except RuntimeError:
+            # Handle cases where curve_fit fails to converge
+            print(f"Warning: curve_fit failed to converge for {num_param} parameters")
+            break
+    
+    return params, AAD
+
+
+def fit_densities(Tc, rho_c, T, rho_sat_vapor, rho_sat_liquid, print_AAD=False, plot=False):
+    f_liq, f_vap, liquid_params, vapor_params = None, None, None, None
+
+    def wrap_liq(T, *p):
+        return rho_liquid(T, Tc, rho_c, p)
+    
+    def wrap_vap(T, *p):
+        return rho_vapor(T, Tc, rho_c, p)
+    
+    def wrap_alt(T, *p):
+        return rho_altern(T, Tc, rho_c, p)
+
+    # Apply masks
+    mask_below_Tc = T < Tc
+    mask_T_min = T > Tc * 0
+    is_not_nan = np.isfinite(rho_sat_liquid)
+    
+
+    # Filter arrays using boolean indexing
+    T_filtered = T[mask_below_Tc & mask_T_min & is_not_nan]
+    rho_sat_liquid_filtered = rho_sat_liquid[mask_below_Tc & mask_T_min & is_not_nan]
+    rho_sat_vapor_filtered = rho_sat_vapor[mask_below_Tc & mask_T_min & is_not_nan]
+
+    # Fit liquid density
+    try:
+        liquid_params, AAD = adjuster(T_filtered, rho_sat_liquid_filtered, wrap_liq, 4)
+        f_liq = lambda T: wrap_liq(T, *liquid_params)
+        if print_AAD:
+            print(f"Liquid AAD: {AAD}")
+    except Exception as e:
+        print(f"Liquid fit failed with 4 parameters, trying alternative: {e}")
+        try:
+            liquid_params, AAD = adjuster(T_filtered, rho_sat_liquid_filtered, wrap_alt, 2)
+            f_liq = lambda T: wrap_alt(T, *liquid_params)
+            if print_AAD:
+                print(f"Liquid alternative AAD: {AAD}")
+        except Exception as e2:
+            print(f"Liquid alternative fit also failed: {e2}")
+            return None, None
+
+    # Fit vapor density
+    try:
+        vapor_params, AAD = adjuster(T_filtered, rho_sat_vapor_filtered, wrap_vap, 5)
+        f_vap = lambda T: wrap_vap(T, *vapor_params)
+        if print_AAD:
+            print(f"Vapor AAD: {AAD}")
+    except Exception as e:
+        print(f"Vapor fit failed with 5 parameters, trying alternative: {e}")
+        try:
+            vapor_params, AAD = adjuster(T_filtered, rho_sat_vapor_filtered, wrap_alt, 2)
+            f_vap = lambda T: wrap_alt(T, *vapor_params)
+            if print_AAD:
+                print(f"Vapor alternative AAD: {AAD}")
+        except Exception as e2:
+            print(f"Vapor alternative fit also failed: {e2}")
+            return None, None
+
+
+    return f_liq, f_vap
+
+def replacer(Tc, rho_c, T, rho_sat_vapor, rho_sat_liquid, print_AAD=False, plot=False):
+    f_liq, f_vap = fit_densities(Tc, rho_c, T, rho_sat_vapor, rho_sat_liquid, print_AAD, plot)
+    for i,t in enumerate(T):
+        liq_ext = f_liq(t)
+        vap_ext = f_vap(t)
+        liq_err = np.abs( (liq_ext - rho_sat_liquid[i])/liq_ext )
+        vap_err = np.abs( (vap_ext - rho_sat_vapor[i])/vap_ext )
+        if liq_err>100:
+            rho_sat_liquid[i] = liq_err
+        if vap_err>100:
+            rho_sat_vapor[i] = vap_err  
+    return rho_sat_vapor,rho_sat_liquid
+
+
+
+def Error_spliter(Matrix, vp_CES, vp_CP, N, T, P, Tc_CP, Pc_CP,Tc_CES, Pc_CES, Tsat_CP,Tsat_CES):
+
+    # Find critical indices (no +1 needed in Python)
+    Pc_CES_ind = bisect_left(P, Pc_CES)
+    Tc_CES_ind = bisect_left(T, Tc_CES)
+    Pc_CP_ind = bisect_left(P, Pc_CP)
+    Tc_CP_ind = bisect_left(T, Tc_CP)
+    vp_CES_ind = [bisect(P, i) for i in vp_CES]
+    vp_CP_ind = [bisect(P, i) for i in vp_CP]
+    
+    # Initialize masks
+    mask_supercritical_liquid = np.full(Matrix.shape, False, dtype=bool)
+    mask_supercritical_gas = np.full(Matrix.shape, False, dtype=bool)
+    mask_supercritical = np.full(Matrix.shape, False, dtype=bool)
+    mask_liquid = np.full(Matrix.shape, False, dtype=bool)
+    mask_gas = np.full(Matrix.shape, False, dtype=bool)
+
+    # Supercritical region
+    mask_supercritical_liquid[0:Tc_CP_ind, Pc_CP_ind:N] = True
+    mask_supercritical_gas[Tc_CP_ind:N, 0:Pc_CP_ind] = True
+    mask_supercritical[Tc_CP_ind:N, Pc_CP_ind:N] = True
+    
+    if Tc_CP>Tc_CES:
+        for vp_CES_i, vp_CP_i, T_CES in zip(vp_CES_ind, vp_CP_ind,Tsat_CES):
+            vp_min = min(vp_CES_i, vp_CP_i)
+            vp_max = max(vp_CES_i, vp_CP_i)
+            Tsat_ind = bisect(Tsat_CES, T_CES)
+            mask_gas[Tsat_ind, 0:vp_min] = True
+            mask_liquid[Tsat_ind, vp_max:Pc_CP_ind] = True
+    elif  Tc_CES>Tc_CP:
+        for vp_CES_i, vp_CP_i, T_CP in zip(vp_CES_ind, vp_CP_ind,Tsat_CP): 
+            vp_min = min(vp_CES_i, vp_CP_i)
+            vp_max = max(vp_CES_i, vp_CP_i) 
+            Tsat_ind = bisect(Tsat_CP, T_CP)
+            mask_gas[Tsat_ind, 0:vp_min] = True
+            mask_liquid[Tsat_ind, vp_max:Pc_CP_ind] = True
+            
+    elif  Tc_CES==Tc_CP:
+        for vp_CES_i, vp_CP_i, T_CP in zip(vp_CES_ind, vp_CP_ind,Tsat_CP):
+            vp_min = min(vp_CES_i, vp_CP_i)
+            vp_max = max(vp_CES_i, vp_CP_i) 
+            Tsat_ind = bisect(Tsat_CP, T_CP)
+            mask_gas[Tsat_ind, 0:vp_min] = True
+            mask_liquid[Tsat_ind, vp_max:Pc_CP_ind] = True
+
+    return mask_supercritical_liquid | mask_supercritical_gas | mask_supercritical | mask_gas | mask_liquid , {
+        "supercritical liquid": mask_supercritical_liquid,
+        "supercritical gas": mask_supercritical_gas,
+        "supercritical": mask_supercritical,
+        "gas": mask_gas,
+        "liquid": mask_liquid
+    }
+
+
+def interpolate_zone(Rho_CES,error, good,phase,T,P, meth="nearest"):
+    Rho_error = np.zeros(Rho_CES.shape)
+    Rho_good = np.zeros(Rho_CES.shape)
+    Rho_error[phase] = error[phase]
+    Rho_good[phase] = good[phase]
+
+    Rho_error = Rho_error > 0
+    Rho_good  = Rho_good  > 0
+
+
+    
+    points = np.column_stack((np.ravel(T[Rho_good]), np.ravel(P[Rho_good])))
+    xi = np.column_stack((np.ravel(T[Rho_error]), np.ravel(P[Rho_error])))
+    values = np.ravel(Rho_CES[Rho_good])
+    interpolated_ = griddata(points,values,xi, method=meth)
+    return interpolated_ 
+
+
+def interpolator(Rho_CES, T, P, Rho_error, Rho_good,regions, method="nearest"):
+    # Create grid
+    
+    Pgrid, Tgrid = np.meshgrid(P, T)
+
+    # Split regions
+    sup_reg_,sup_gas_reg_,sup_liq_reg_, gas_reg_, liq_reg_ = regions["supercritical"],regions["supercritical gas"],regions["supercritical liquid"], regions["gas"], regions["liquid"]
+    print(sup_liq_reg_ , sup_reg_)
+    sup_reg, gas_reg, liq_reg = sup_liq_reg_ | sup_reg_, sup_gas_reg_ | gas_reg_, liq_reg_
+
+
+    # Pre-extract known phase data
+    Rho_sup = Rho_error[sup_reg]
+    Rho_gas = Rho_error[gas_reg]
+    Rho_liq = Rho_error[liq_reg]
+    
+    result = np.zeros(Rho_CES.shape)
+
+    # Decide which region (Tq, Pq) belongs to
+    if np.any(Rho_sup):
+        interpolated_sup = interpolate_zone(Rho_CES,Rho_error, Rho_good,sup_reg,Tgrid,Pgrid, meth=method)
+        result[sup_reg & Rho_error ]     = interpolated_sup
+    
+    if np.any(Rho_gas):
+        interpolated_gas = interpolate_zone(Rho_CES,Rho_error, Rho_good,gas_reg,Tgrid,Pgrid, meth=method)
+        result[gas_reg & Rho_error ] = interpolated_gas
+    
+    if np.any(Rho_liq):
+        interpolated_liq = interpolate_zone(Rho_CES,Rho_error, Rho_good,liq_reg,Tgrid,Pgrid, meth=method)
+        result[liq_reg & Rho_error ] = interpolated_liq
+    
+    return result  
+
+
 def Medi(Equation, Substance):
+    handle = CoolProp.AbstractState("HEOS", Substance)
     N = 500
     Rho_CES_info = file_loader(Equation,Substance,"density")
     Sres_CES_info =file_loader(Equation,Substance,"residual entropy")
@@ -360,7 +533,7 @@ def Medi(Equation, Substance):
     
     Tsat_min = 0.5*(Tc_CP)
     Tsat_min_ind = bisect(Tsat_pv_CP, Tsat_min)
-    
+
     if Tc_CP > Tc_CES:
         Tsat = Tsat_hv_CES
         Hv_CP = Hv_CP[Tsat_hv_CP<Tc_CES]
@@ -372,6 +545,7 @@ def Medi(Equation, Substance):
         Sres_sat_liq_CP = Sres_sat_liq_CP[Tsat_hv_CP<Tc_CES]
         Phi_sat_liq_CP = Phi_sat_liq_CP[Tsat_hv_CP<Tc_CES]        
     elif Tc_CES > Tc_CP:
+
         Tsat = Tsat_hv_CES
         Hv_CES = Hv_CES[Tsat_hv_CES<Tc_CP]
         pv_CES = pv_CES[Tsat_hv_CES<Tc_CP]
@@ -383,7 +557,6 @@ def Medi(Equation, Substance):
         Phi_sat_liq_CES = Phi_sat_liq_CES[Tsat_hv_CES<Tc_CP]     
     else:
         Tsat = Tsat_hv_CES
-    
     dist = os.path.join(base_dir, "Distributions")
     dist_eos = os.path.join(dist,Equation)
     dist_subs = os.path.join(dist_eos,Substance)
@@ -398,21 +571,24 @@ def Medi(Equation, Substance):
     Hv_error = np.abs(Hv_CP - Hv_CES) * 100 / np.abs(Hv_CP)
     pv_error = np.abs(pv_CP - pv_CES) * 100 / np.abs(pv_CP)
     
-    
+    #Rho_sat_vap_CP, Rho_sat_liq_CP = replacer(Tc_CP, handle.rhomolar_critical(), Tsat_hv_CP, Rho_sat_vap_CP, Rho_sat_liq_CP, print_AAD=False, plot=False)
+
+    print("Rho_error = ",np.where(np.isnan(Rho_error)))
     plot_error_distribution(Rho_error,"Density",dist_subs,f"Density", bins=50)
     plot_error_distribution(Sres_error,"Residual entropy",dist_subs,f"Residual entropy", bins=50)
     plot_error_distribution(Phi_error,"Fugacity coefficient",dist_subs,f"Fugacity coefficient", bins=50)
     plot_error_distribution(Hv_error,"Residual entropy",dist_subs,f"Residual entropy", bins=50)
     plot_error_distribution(pv_error,"Fugacity coefficient",dist_subs,f"Fugacity coefficient", bins=50)
     
-    Rho_split = Error_spliter(Rho_error, pv_CES, pv_CP, N, T_CP, P_CP, Tc_CP, Pc_CP,Tc_CES, Pc_CES, Tsat_hv_CP,Tsat_hv_CES)
-    Sres_split = Error_spliter(Sres_error, pv_CES, pv_CP, N, T_CP, P_CP, Tc_CP, Pc_CP,Tc_CES, Pc_CES, Tsat_hv_CP,Tsat_hv_CES)
-    Phi_split = Error_spliter(Phi_error, pv_CES, pv_CP, N, T_CP, P_CP, Tc_CP, Pc_CP,Tc_CES, Pc_CES, Tsat_hv_CP,Tsat_hv_CES)
-
-    
-    
     Tr = T_CP/Tc_CP
     Tsatr = Tsat_pv_CP/Tc_CP 
+    
+    total_mask, Masks = Error_spliter(Rho_error, pv_CES, pv_CP, N, T_CP, P_CP, Tc_CP, Pc_CP,Tc_CES, Pc_CES, Tsat_hv_CP,Tsat_hv_CES)
+    Rho_split, Sres_split, Phi_split = {},{},{}
+    for phase,mask in Masks.items():
+        Rho_split[phase] = Rho_error[mask]
+        Sres_split[phase]= Sres_error[mask]
+        Phi_split[phase] = Phi_error[mask]
     
     Rho_split["Saturated liquid"] = np.abs(Rho_sat_liq_CP[Tsat_min_ind:Tsat_max_ind] - Rho_sat_liq_CES[Tsat_min_ind:Tsat_max_ind]) * 100 / np.abs(Rho_sat_liq_CP[Tsat_min_ind:Tsat_max_ind])
     Rho_split["Saturated vapor"] = np.abs(Rho_sat_vap_CP[Tsat_min_ind:Tsat_max_ind] - Rho_sat_vap_CES[Tsat_min_ind:Tsat_max_ind]) * 100 / np.abs(Rho_sat_vap_CP[Tsat_min_ind:Tsat_max_ind])
@@ -423,9 +599,7 @@ def Medi(Equation, Substance):
     Phi_split["Saturated liquid"] = np.abs(Phi_sat_liq_CP[Tsat_min_ind:Tsat_max_ind] - Phi_sat_liq_CES[Tsat_min_ind:Tsat_max_ind]) * 100 / np.abs(Phi_sat_liq_CP[Tsat_min_ind:Tsat_max_ind])
     Phi_split["Saturated vapor"] = np.abs(Phi_sat_vap_CP[Tsat_min_ind:Tsat_max_ind] - Phi_sat_vap_CES[Tsat_min_ind:Tsat_max_ind]) * 100 / np.abs(Phi_sat_vap_CP[Tsat_min_ind:Tsat_max_ind])
     
-    Rho_aggr = []
-    Sres_aggr = []
-    Phi_aggr = []
+    
     
     
     for phase,rho_array in Rho_split.items():
@@ -435,43 +609,186 @@ def Medi(Equation, Substance):
         plot_error_distribution(rho_phase,f"Density {phase}",dist_subs,f"Density {phase}", bins=50)
         plot_error_distribution(sres_phase,f"Residual entropy {phase}",dist_subs,f"Residual entropy {phase}", bins=50)
         plot_error_distribution(phi_phase,f"Fugacity coefficient {phase}",dist_subs,f"Fugacity coefficient {phase}", bins=50)
-        Rho_aggr.extend(rho_phase.flatten().tolist())
-        Sres_aggr.extend(sres_phase.flatten().tolist())
-        Phi_aggr.extend(phi_phase.flatten().tolist())
-    Rho_aggr = np.array(Rho_aggr)
-    Sres_aggr = np.array(Sres_aggr)
-    Phi_aggr = np.array(Phi_aggr)
-    
-    
+        
 
+    Rho_aggr = np.zeros(Rho_error.shape)
+    Sres_aggr = np.zeros(Rho_error.shape)
+    Phi_aggr = np.zeros(Rho_error.shape)  
+    
+    Rho_aggr[total_mask] = Rho_error[total_mask]
+    Sres_aggr[total_mask] = Sres_error[total_mask]
+    Phi_aggr[total_mask] = Phi_error[total_mask]    
+    
+    Rho_error = total_mask & (Rho_aggr>100)
+    Rho_good = total_mask & (Rho_aggr<100)
+    Rho_int = interpolator(Rho_CP, T_CP, P_CP, Rho_error, Rho_good,Masks , method="nearest")
 
+    Rho_sus = np.zeros(Rho_int.shape)
+    Rho_out = np.zeros(Rho_int.shape)
+    
+    Rho_sus[Rho_aggr>100] = Rho_CP[Rho_aggr>100]
+    Rho_dif = np.abs(Rho_int - Rho_sus)/Rho_sus
+    
+    Rho_out[Rho_dif>50] = Rho_dif[Rho_dif>50]
+    
+    Rho_tocheck = np.where(Rho_out>0, True, False )
+    
+    rows, cols = np.where(Rho_tocheck)
+    radius = 1
+    
+    for row, col in zip(rows, cols):
+        excluded_char.at[Substance,"T"] = T_CP[row]
+        excluded_char.at[Substance,"P"] = P_CP[col]
+        for i in range(-radius, radius + 1):
+            for j in range(-radius, radius + 1):
+                excluded_char.at[Substance, f"CP {i}x{j}"] = Rho_CP[row + i, col + j]
+
+        for i in range(-radius, radius + 1):
+            for j in range(-radius, radius + 1):
+                excluded_char.at[Substance, f"CES {i}x{j}"] = Rho_CES[row + i, col + j]
+
+    Rho_sat_liq = Rho_split["Saturated liquid"] 
+    Rho_sat_vap = Rho_split["Saturated vapor"] 
+    print(Rho_sat_liq>200,Rho_sat_vap>200)
+    print(type(Rho_sat_liq[0]), type(Rho_sat_vap[0]))
+
+    A =(Rho_sat_liq>200).astype(bool)
+    B =(Rho_sat_vap>200).astype(bool)
+
+    indexes = np.where(A | B)[0]
+    radius = 2
+    for ind in indexes:
+        excluded_char.at[Substance,"T"] = Tsat_pv_CP[row]
+        for i in range(-radius, radius + 1):
+            excluded_char.at[Substance, f"CES sat {i}"] = Rho_sat_liq_CES[row + i]
+
+        for i in range(-radius, radius + 1):
+            excluded_char.at[Substance, f"CES sat {i}"] = Rho_sat_vap_CES[row + i]
+    
+        for i in range(-radius, radius + 1):
+            excluded_char.at[Substance, f"CP sat {i}"] = Rho_sat_liq_CP[row + i]
+
+        for i in range(-radius, radius + 1):
+            excluded_char.at[Substance, f"CP sat {i}"] = Rho_sat_vap_CP[row + i]
+    
+    """
+    if Substance == "R1243zf":
+        rho_sat = np.array(Rho_split["Saturated vapor"])
+        x = Rho_sat_vap_CP[Tsat_min_ind:Tsat_max_ind]
+        y = Rho_sat_vap_CES[Tsat_min_ind:Tsat_max_ind]
+        z = Rho_sat_liq_CP[Tsat_min_ind:Tsat_max_ind] 
+        w = Rho_sat_liq_CES[Tsat_min_ind:Tsat_max_ind]
+        k = Hv_error
+        flat_arr = Rho_error.flatten()
+        errors = np.abs(flat_arr)
+        sorted_indices = np.argsort(errors)[::-1]
+        sorted_errors = errors[sorted_indices]
+        original_indices = np.unravel_index(sorted_indices, Rho_error.shape)
+        index_tuples = list(zip(*original_indices))
+        print(f"sorted errrors = {sorted_errors[0:200].tolist()}")
+        print(index_tuples[0:200])
+        print("x = ",x[408:413])
+        print("y = ",y[408:413])
+        print("z = ",z[408:413])
+        print("w = ",w[408:413])
+        print("k = ",k[408:413])
+        print(rho_sat.shape)
+    """
     Sum = {}
     
     regions = ["supercritical liquid","supercritical gas","supercritical","liquid","gas","Saturated liquid","Saturated vapor"]
     
+        
     den_stat, fug_reg_stat, sres_stat, hv_stat, vp_stat, fug_abs_stat = {},{},{},{},{},{}
     for region in regions:
+        Rho_region = Rho_split[region]
+        Sres_region = Sres_split[region]
+        Phi_region = Phi_split[region]
+            
+        Rho_finite = Rho_region[np.isfinite(Rho_region)]
+        Sres_finite = Sres_region[np.isfinite(Sres_region)]
+        Phi_finite = Phi_region[np.isfinite(Phi_region)]
+            
+        Rho_mean = np.nanmean(Rho_finite)
+        Sres_mean= np.nanmean(Sres_finite)
+        Phi_mean = np.nanmean(Phi_finite)
+            
+        Rho_median = np.nanmedian(Rho_finite) 
+        Sres_median= np.nanmedian(Sres_finite)
+        Phi_median = np.nanmedian(Phi_finite) 
+
+        Rho_nan = np.isnan(Rho_region[Tc_ind:]).sum() if not np.isnan(Rho_median) else 5000
+        Sres_nan = np.isnan(Sres_region[Tc_ind:]).sum() if not np.isnan(Sres_median) else 5000
+        Phi_nan = np.isnan(Phi_region[Tc_ind:]).sum() if not np.isnan(Phi_median) else 5000
+        
+        if np.isnan(Rho_median):
+            print(f"Rho_median is nan for {Substance} in {region}")
+        if np.isnan(Sres_median):
+            print(f"Sres_median is nan for {Substance} in {region}")
+        if np.isnan(Phi_median):
+            print(f"Phi_median is nan for {Substance} in {region}")
+        
         if region in ["Saturated liquid","Saturated vapor"]:
-            den_stat[region]     = {"mean":np.nanmean(Rho_split[region][np.isfinite(Rho_split[region])]),"median":np.nanmedian(Rho_split[region][np.isfinite(Rho_split[region])]), "NaNs":np.isnan(Rho_split[region][Tc_ind:]).sum(), "Infs":np.isinf(Rho_split[region][Tc_ind:]).sum(),"Count":Rho_split[region].size-Tc_ind, "Tr" : Tsatr[np.where(np.isnan(Rho_split[region][Tc_ind:]) | np.isinf(Rho_split[region][Tc_ind:]))[0]]}
-            sres_stat[region]    = {"mean":np.nanmean(Sres_split[region][np.isfinite(Sres_split[region])]),"median":np.nanmedian(Sres_split[region][np.isfinite(Sres_split[region])]), "NaNs":np.isnan(Sres_split[region][Tc_ind:]).sum(), "Infs":np.isinf(Sres_split[region][Tc_ind:]).sum(),"Count":Sres_split[region].size-Tc_ind, "Tr" : Tsatr[np.where(np.isnan(Sres_split[region][Tc_ind:]) | np.isinf(Sres_split[region][Tc_ind:]))[0]]}
-            fug_reg_stat[region] = {"mean":np.nanmean(Phi_split[region][np.isfinite(Phi_split[region])]),"median":np.nanmedian(Phi_split[region][np.isfinite(Phi_split[region])]), "NaNs":np.isnan(Phi_split[region][Tc_ind:]).sum(), "Infs":np.isinf(Phi_split[region][Tc_ind:]).sum(),"Count":Phi_split[region].size-Tc_ind, "Tr" : Tsatr[np.where(np.isnan(Phi_split[region][Tc_ind:]) | np.isinf(Phi_split[region][Tc_ind:]))[0]]}
+            
+            
+            den_stat[region]     = {"mean":Rho_mean,"median":Rho_median, "NaNs":Rho_nan, "Infs":np.isinf(Rho_region[Tc_ind:]).sum(),"Count":Rho_region.size-Tc_ind, "Tr" : Tsatr[np.where(np.isnan(Rho_region[Tc_ind:]) | np.isinf(Rho_region[Tc_ind:]))[0]]}
+            sres_stat[region]    = {"mean":Sres_mean,"median":Sres_median, "NaNs":Sres_nan, "Infs":np.isinf(Sres_region[Tc_ind:]).sum(),"Count":Sres_region.size-Tc_ind, "Tr" : Tsatr[np.where(np.isnan(Sres_region[Tc_ind:]) | np.isinf(Sres_region[Tc_ind:]))[0]]}
+            fug_reg_stat[region] = {"mean":Phi_mean,"median":Phi_median, "NaNs":Phi_nan, "Infs":np.isinf(Phi_region[Tc_ind:]).sum(),"Count":Phi_region.size-Tc_ind, "Tr" : Tsatr[np.where(np.isnan(Phi_region[Tc_ind:]) | np.isinf(Phi_region[Tc_ind:]))[0]]}
         else:
-            den_stat[region]     = {"mean":np.nanmean(Rho_split[region][np.isfinite(Rho_split[region])]),"median":np.nanmedian(Rho_split[region][np.isfinite(Rho_split[region])]), "NaNs":np.isnan(Rho_split[region]).sum(), "Infs":np.isinf(Rho_split[region]).sum(),"Count":Rho_split[region].size}
-            sres_stat[region]    = {"mean":np.nanmean(Sres_split[region][np.isfinite(Sres_split[region])]),"median":np.nanmedian(Sres_split[region][np.isfinite(Sres_split[region])]), "NaNs":np.isnan(Sres_split[region]).sum(), "Infs":np.isinf(Sres_split[region]).sum(),"Count":Sres_split[region].size}
-            fug_reg_stat[region] = {"mean":np.nanmean(Phi_split[region][np.isfinite(Phi_split[region])]),"median":np.nanmedian(Phi_split[region][np.isfinite(Phi_split[region])]), "NaNs":np.isnan(Phi_split[region]).sum(), "Infs":np.isinf(Phi_split[region]).sum(),"Count":Phi_split[region].size}
+            den_stat[region]     = {"mean":Rho_mean,"median":Rho_median, "NaNs":Rho_nan, "Infs":np.isinf(Rho_split[region]).sum(),"Count":Rho_split[region].size}
+            sres_stat[region]    = {"mean":Sres_mean,"median":Sres_median, "NaNs":Sres_nan, "Infs":np.isinf(Sres_split[region]).sum(),"Count":Sres_split[region].size}
+            fug_reg_stat[region] = {"mean":Phi_mean,"median":Phi_median, "NaNs":Phi_nan, "Infs":np.isinf(Phi_split[region]).sum(),"Count":Phi_split[region].size}
         
+        den_stat["overall"]     = {"mean": np.nanmean((Rho_aggr[Rho_aggr < 1e6])),"median":np.nanmedian((Rho_aggr[Rho_aggr < 1e6]))}
+        sres_stat["overall"]    = {"mean": np.nanmean((Sres_aggr[Sres_aggr < 1e6])),"median":np.nanmedian((Sres_aggr[Sres_aggr < 1e6]))}
+        fug_reg_stat["overall"] = {"mean": np.nanmean((Phi_aggr[Phi_aggr < 1e6])),"median":np.nanmedian((Phi_aggr[Phi_aggr < 1e6]))}
         
-        
-        den_stat["overall"]     = {"mean": np.nanmean((Rho_aggr)),"median":np.nanmedian((Rho_aggr))}
-        sres_stat["overall"]    = {"mean": np.nanmean((Sres_aggr)),"median":np.nanmedian((Sres_aggr))}
-        fug_reg_stat["overall"] = {"mean": np.nanmean((Phi_aggr)),"median":np.nanmedian((Phi_aggr))}
+        excluded.at[Substance,"density"] = Rho_aggr[Rho_aggr > 1e6].size
+        excluded.at[Substance,"entropy"] = Sres_aggr[Sres_aggr > 1e6].size
+        excluded.at[Substance,"fugacity"] = Phi_aggr[Phi_aggr > 1e6].size
     
     
+    Hv_clean = Hv_error[np.isfinite(Hv_error)]
+    pv_clean = pv_error[np.isfinite(pv_error)]
+    Phi_conc = np.concatenate(list(Phi_split.values()))
+    
+    Hv_filtered = Hv_clean[Hv_clean<200]
+    pv_filtered = pv_clean[pv_clean<200]
+    Phi_filtered= Phi_conc[np.isfinite(Phi_conc)]
+    
+    Hv_mean = np.nanmean(Hv_filtered)
+    pv_mean = np.nanmean(pv_filtered)
+    Phi_mean = np.nanmean(Phi_filtered)
+    
+    Hv_median = np.nanmedian(Hv_filtered)
+    pv_median = np.nanmedian(pv_filtered)
+    Phi_median = np.nanmedian(Phi_filtered)
+    
+    Hv_nan = np.isnan(Hv_error[Tc_ind:]).sum()
+    pv_nan = np.isnan(pv_error[Tc_ind:]).sum()
 
-    hv_stat  = {"mean":np.nanmean(Hv_error[np.isfinite(Hv_error)]),"median":np.nanmedian(Hv_error[np.isfinite(Hv_error)]), "NaNs":np.isnan(Hv_error[Tc_ind:]).sum(), "Infs":np.isinf(Hv_error[Tc_ind:]).sum(),"Count":Hv_error.size-Tc_ind, "Tr" : Tsatr[np.where(np.isnan(Hv_error[Tc_ind:]) | np.isinf(Hv_error[Tc_ind:]))[0]]}
-    vp_stat  = {"mean":np.nanmean(pv_error[np.isfinite(pv_error)]),"median":np.nanmedian(pv_error[np.isfinite(pv_error)]), "NaNs":np.isnan(pv_error[Tc_ind:]).sum(), "Infs":np.isinf(pv_error[Tc_ind:]).sum(),"Count":pv_error.size-Tc_ind, "Tr" : Tsatr[np.where(np.isnan(pv_error[Tc_ind:]) | np.isinf(pv_error[Tc_ind:]))[0]]}
-    fug_abs_stat = {"mean":np.nanmean(np.concatenate(list(Phi_split.values()))[np.isfinite(np.concatenate(list(Phi_split.values())))]),"median":np.nanmedian(np.concatenate(list(Phi_split.values()))[np.isfinite(np.concatenate(list(Phi_split.values())))]),"Count":np.concatenate(list(Phi_split.values())).size} 
+    Hv_nan = np.isnan(Hv_error[Tc_ind:]).sum() if not np.isnan(Hv_median) else 5000
+    pv_nan = np.isnan(pv_error[Tc_ind:]).sum() if not np.isnan(pv_median) else 5000
+    
+    Hv_inf = np.isinf(Hv_error[Tc_ind:]).sum() if not np.isnan(Hv_median) else 5000
+    pv_inf = np.isinf(pv_error[Tc_ind:]).sum() if not np.isnan(pv_median) else 5000
+    
+    if np.isnan(Hv_median):
+        print(f"Hv_median is nan for {Substance}, mean {Hv_median}, median {Hv_median}")
+    if np.isnan(pv_median):
+        print(f"pv_median is nan for {Substance}, mean {pv_mean}, median {pv_median}, pv_filtered {pv_filtered} pv_clean {pv_clean}")
+    if np.isnan(Phi_median):
+        print(f"Phi_median is nan for {Substance}, mean {Phi_median}, median {Phi_median}")
+    
+    
+    hv_stat  = {"mean":Hv_mean,"median":Hv_median, "NaNs":Hv_nan, "Infs":Hv_inf,"Count":Hv_error.size-Tc_ind, "Tr" : Tsatr[np.where(np.isnan(Hv_error[Tc_ind:]) | np.isinf(Hv_error[Tc_ind:]))[0]]}
+    vp_stat  = {"mean":pv_mean,"median":pv_median, "NaNs":pv_nan, "Infs":pv_inf,"Count":pv_error.size-Tc_ind, "Tr" : Tsatr[np.where(np.isnan(pv_error[Tc_ind:]) | np.isinf(pv_error[Tc_ind:]))[0]]}
+    fug_abs_stat = {"mean":Phi_mean,"median":Phi_median,"Count":Phi_conc.size} 
+    
+    excluded.at[Substance,"Hv"] = Hv_clean[Hv_clean>200].size
+    excluded.at[Substance,"pv"] = pv_clean[pv_clean>200].size
 
+    
     Sum["density"] = den_stat
     Sum["fugacity"] = fug_abs_stat
     Sum["residual entropy"] = sres_stat
@@ -486,14 +803,16 @@ def Medi(Equation, Substance):
 
 Med = {}
 ES = {}
-for comp in compounds:
+
+
+for comp in compounds: 
     try:
         Sum = Medi(sys.argv[2], comp)
-        ES[comp] = Sum
-
+        ES[comp] = Sum   
     except Exception as e:
         pass
-    Med[sys.argv[2]] = ES
+
+Med[sys.argv[2]] = ES
 
 
 eos_dir = os.path.join(base_dir, sys.argv[2])
@@ -529,7 +848,6 @@ def Matrix_generator(EOS, excluded, type):
     Mean_chains_phases  = pd.DataFrame()
     Median_apolar_phases  = pd.DataFrame()
     Mean_apolar_phases  = pd.DataFrame()
-    
     valid_compounds = set(compounds) & set(data_main[EOS].keys())
     properties = eval_props  
     properties_no = eval_propp
@@ -953,7 +1271,7 @@ def PCA_(EOS, excluded_subtances,name,path, robust=False):
     
     nan_positions = PC_matrix.isna().stack()
     nan_locations = nan_positions[nan_positions].index.tolist()
-    #print("NaN positions (row, col):", nan_locations)
+    print("NaN positions (row, col):", nan_locations)
     allowed_compounds = set(valid_compounds) - set(excluded_subtances)
     
     
@@ -1038,11 +1356,15 @@ def graph_sets(df,number,path):
 
 
 def biplot_gen(explained_variance,folder,pca_data,loadings,PC_matrix,PCA_info,Name):
+
     for i, var in enumerate(zip(explained_variance)):
         if i%2==0 and i!=explained_variance.size-1:
-            biplot_filename = os.path.join(folder, f"distance biplot PC {i} and {i+1}.html")
+            folder_name = os.path.join(folder, f'{Name} PCA')
+            ensure_dir_exists(folder_name)
+            biplot_filename = os.path.join(folder_name, f"distance biplot PC {i} and {i+1}.html")
             plotly_distance_biplot(pca_data, loadings, PC_matrix, comp_x=i, comp_y=i+1, scale_arrow=1.0, output_file=biplot_filename)
         PCA_info.at[f"PCA {i}", f"Explained variance {Name} PCA"] = str(var[0])
+        
 
 def bar_chart(data,Property,path):
     bins = np.linspace(0, 1, 11)  # 10 bins between 0 and 1
@@ -1073,9 +1395,9 @@ def group_graphs(PCA_submatrix,path):
             
             fig = px.scatter(x=x, y=y, hover_name=names, labels={'x': prop, 'y': 'fugacity coefficient'})
             fig.write_html(name)
-def total_graph(PCA_matrix,path):
+def total_graph(PCA_matrix,path,EOS):
     for prop in list(PCA_matrix.columns):
-        folder = os.path.join(path, "total")
+        folder = os.path.join(path, EOS)
         ensure_dir_exists(folder)
         name = os.path.join(folder, f"{prop}.html")
         y = list(PCA_matrix.loc[:,"fugacity"])
@@ -1083,168 +1405,48 @@ def total_graph(PCA_matrix,path):
         names = PCA_matrix.index
         fig = px.scatter(x=x, y=y, hover_name=names, labels={'x': prop, 'y': 'fugacity coefficient'})
         fig.write_html(name)
-def PCA_region(EOS, type):
-
+        
+def file_structurer(base_dir,EOS,type):
     bip_dir = os.path.join(base_dir, "Biplots")
-    cor_dir = os.path.join(base_dir, "correlation",EOS)
-    ensure_dir_exists(cor_dir)
-    
     bar_dir = os.path.join(base_dir, "Bar plots")
-    eos_bar = os.path.join(bar_dir, EOS)
-    ensure_dir_exists(eos_bar)
+    excel_dir = os.path.join(base_dir, f'Excel {type} data')
     
+    
+
+    
+    Robust_cor = os.path.join(base_dir, f'Robust {type} correlations',EOS)
+    Zero_cor = os.path.join(base_dir, f'Zero {type} correlations',EOS)
+    tot_cor = os.path.join(base_dir, f'Total  {type} correlation',EOS)
+
+    eos_bar = os.path.join(bar_dir, EOS)
     eos_dir = os.path.join(bip_dir, EOS)
     type_dir = os.path.join(eos_dir, type)
-    attempt_dir = get_next_attempt_dir(type_dir)
-    ensure_dir_exists(attempt_dir)
-
-    excel_dir = os.path.join(base_dir, 'Excel data')
+    
     ensure_dir_exists(excel_dir)
-    
-    excel_filename = os.path.join(excel_dir, f'{EOS} Results.xlsx')
+    ensure_dir_exists(eos_bar)
+    ensure_dir_exists(eos_dir)
+    ensure_dir_exists(type_dir)  
+    return bip_dir, bar_dir, excel_dir, Robust_cor, Zero_cor, tot_cor, eos_bar, eos_dir, type_dir
 
-    First = os.path.join(attempt_dir, 'First PCA')
-    Secon = os.path.join(attempt_dir, 'Second PCA')    
-    
-    Aceptors = os.path.join(attempt_dir, 'Aceptors PCA')
-    Chains = os.path.join(attempt_dir, 'Chains PCA')
-    Neutrals = os.path.join(attempt_dir, 'Neutrals PCA')
-    Robust = os.path.join(attempt_dir, 'Robust PCA')
-    Zero = os.path.join(attempt_dir, 'Zero PCA')
-    
-    First_cor = os.path.join(base_dir, 'First correlation')
-    Secon_cor = os.path.join(base_dir, 'Second correlation')    
-    Aceptors_cor = os.path.join(base_dir, 'Aceptors correlation')
-    Chains_cor = os.path.join(base_dir, 'Chains correlation')
-    Neutrals_cor = os.path.join(base_dir, 'Neutrals correlation')
-    Robust_cor = os.path.join(base_dir, 'Robust correlation')
-    Zero_cor = os.path.join(base_dir, 'Zero correlation')
-    tot_cor = os.path.join(base_dir, 'Total correlation')
-    
-    if not os.path.exists(First):
-        os.makedirs(First)
-        
-    if not os.path.exists(Secon):
-        os.makedirs(Secon)
-        
-    if not os.path.exists(Aceptors):
-        os.makedirs(Aceptors)
-        
-    if not os.path.exists(Chains):
-        os.makedirs(Chains)
-        
-    if not os.path.exists(Neutrals):
-        os.makedirs(Neutrals)
-    
-    if not os.path.exists(Robust):
-        os.makedirs(Robust)
-    
-    if not os.path.exists(Zero):
-        os.makedirs(Zero)
-        
-        
-        
-    PCA_info = pd.DataFrame()    
-    Excluded_sheet = pd.DataFrame()    
-    Outliers = pd.DataFrame()
-    loadings = pd.DataFrame()
-    loadings_sec = pd.DataFrame()
-    loadings_ace = pd.DataFrame()
-    loadings_cha = pd.DataFrame()
-    loadings_neu = pd.DataFrame()
-    PCA_coordinates = pd.DataFrame()
-    PCA_coordinates_sec = pd.DataFrame()
-    PCA_coordinates_ace = pd.DataFrame()
-    PCA_coordinates_cha = pd.DataFrame()
-    PCA_coordinates_neu = pd.DataFrame()      
-    PC_matrix = pd.DataFrame()
-    PC_matrix_sec = pd.DataFrame()
-    PC_matrix_ace = pd.DataFrame()
-    PC_matrix_cha = pd.DataFrame()
-    PC_matrix_neu = pd.DataFrame()
-    outliers = pd.DataFrame()
-    PCA_info = pd.DataFrame()
-    NaN_sheet_global = pd.DataFrame()
-    Inf_sheet_global = pd.DataFrame()
-    Excluded_sheet = pd.DataFrame()
-    reconstructed = pd.DataFrame()
-    reconstructed_sec = pd.DataFrame()
-    reconstructed_ace = pd.DataFrame()
-    reconstructed_cha = pd.DataFrame()
-    reconstructed_neu = pd.DataFrame()    
-    clus_info = pd.DataFrame()
-    clus_info_sec = pd.DataFrame()
-    clus_info_ace = pd.DataFrame()
-    clus_info_cha = pd.DataFrame()
-    clus_info_neu = pd.DataFrame()    
-
-
-    data, PC_matrix, NaN_sheet_global, Inf_sheet_global,Total_sheet_global, den_sat,fug_sat,sres_sat,hv,vp,Median_sheet_global, Median_sheet_global, Mean_sheet_phases, Median_sheet_phases,Mean_sheet_global,Mean_aceptors_global, Median_aceptors_global, Mean_donors_global, Median_donors_global, Median_chains_global, Mean_chains_global, Median_apolar_global, Mean_apolar_global, Mean_aceptors_phases, Median_aceptors_phases, Mean_donors_phases, Median_donors_phases, Median_chains_phases, Mean_chains_phases, Median_apolar_phases, Mean_apolar_phases  = Matrix_generator(EOS, [], type)
+def char_gen(eos_bar,den_sat,fug_sat,sres_sat,hv,vp,tot_cor,PCA_submatrix_0,Zero_cor,PCA_submatrix_rob,Robust_cor,explained_variance_rob,explained_variance_0,pca_data_rob,pca_data_0,loadings_rob,PC_matrix_rob,PCA_info,loadings_0,PC_matrix_0,EOS,type_dir):
     bar_chart(den_sat,"Density",eos_bar)
     bar_chart(fug_sat,"Fugacity",eos_bar)
     bar_chart(sres_sat,"Residual entropy",eos_bar)
     bar_chart(hv,"Enthalpy",eos_bar)
     bar_chart(vp,"Vapor pressure",eos_bar)
-    fail_rate_global = (NaN_sheet_global + Inf_sheet_global)*100/Total_sheet_global
-
-    substances_nan = set(NaN_sheet_global[NaN_sheet_global.sum(axis=1) > 0].index.tolist())
-    substances_inf = set(Inf_sheet_global[Inf_sheet_global.sum(axis=1) > 0].index.tolist())
     
-    Failing_properties_nan = {r: NaN_sheet_global.columns[NaN_sheet_global.loc[r] > 1].tolist() for r in Inf_sheet_global[NaN_sheet_global.sum(axis=1) > 0].index}
-    Failing_properties_inf = {r: Inf_sheet_global.columns[Inf_sheet_global.loc[r] > 1].tolist() for r in Inf_sheet_global[Inf_sheet_global.sum(axis=1) > 0].index}
-
-    excluded_subtances = substances_nan.union(substances_inf.union(set(["R161","Deuterium","HeavyWater"])))
-    super_excluded = ["R161"]
-    super_excluded = lambda lim: [subs for subs in set(excluded_subtances)-set(["R161","Deuterium","HeavyWater"]) 
-                            if np.any(fail_rate_global.loc[subs,:] > lim) ] + [subs for subs in fail_rate_global.index.tolist() if fail_rate_global.loc[subs,:].isna().any()]
-
-    for subs in excluded_subtances:        
-        try:
-            Excluded_sheet.at[subs, "# NaN den sat"] = NaN_sheet_global.at[subs,"density Saturated liquid"] 
-        except KeyError:
-            pass
-
-        try:
-            Excluded_sheet.at[subs, "# NaN Hv"] = NaN_sheet_global.at[subs,"Hv"]    
-        except KeyError:
-            pass
-        
-        try:
-            Excluded_sheet.at[subs, "# Inf den sat"] = Inf_sheet_global.at[subs,"density Saturated liquid"] 
-        except KeyError:
-            pass
-
-        try:
-            Excluded_sheet.at[subs, "# Inf Hv"] = Inf_sheet_global.at[subs,"Hv"]    
-        except KeyError:
-            pass
+    biplot_gen(explained_variance_rob,type_dir,pca_data_rob,loadings_rob,PC_matrix_rob,PCA_info,"Robust")
+    biplot_gen(explained_variance_0,type_dir,pca_data_0,loadings_0,PC_matrix_0,PCA_info,"Zero")
     
-    try:
-        update_excluded_log(EOS,Excluded_sheet.index)
-    except:
-        []
-    data1, pca_data_0, PC_matrix_0, NaN_sheet_global1, Inf_sheet_global1, explained_variance_0, PCA_coordinates_0, loadings_0,L,S,reconstructed_0,clus_info_0,PCA_submatrix_0 = PCA_(EOS,super_excluded(10),"Zero",base_dir)
-    biplot_gen(explained_variance_0,Zero,pca_data_0,loadings_0,PC_matrix_0,PCA_info,"Zero")
+    group_graphs(PCA_submatrix_rob,Robust_cor)
     group_graphs(PCA_submatrix_0,Zero_cor)
-    total_graph(PC_matrix_0,tot_cor)
-
-    data1, pca_data, PC_matrix, NaN_sheet_global1, Inf_sheet_global1, explained_variance, PCA_coordinates, loadings,L,S,reconstructed,clus_info,PCA_submatrix = PCA_(EOS,super_excluded(10),"first",base_dir)
-    biplot_gen(explained_variance,First,pca_data,loadings,PC_matrix,PCA_info,"first")
-    group_graphs(PCA_submatrix,First_cor)
-    total_graph(PC_matrix,tot_cor)
     
-    try:
-        data1, pca_data_sec, PC_matrix_sec, NaN_sheet_global1, Inf_sheet_global1, explained_variance_sec, PCA_coordinates_sec, loadings_sec,L,S,reconstructed_sec,clus_info_sec,PCA_submatrix_sec = PCA_(EOS,super_excluded(10),"second",base_dir)
-        biplot_gen(explained_variance_sec,Secon,pca_data_sec,loadings_sec,PC_matrix_sec,PCA_info,"second")
-        group_graphs(PCA_submatrix_sec,Secon_cor)
-        total_graph(PC_matrix_sec,tot_cor)
-    except:
-        pass
-
+    total_graph(PC_matrix_rob,tot_cor,EOS)
+    total_graph(PC_matrix_0,tot_cor,EOS)
     
-    try:
+""" try:
         data1, pca_data_ace, PC_matrix_ace, NaN_sheet_global1, Inf_sheet_global1, explained_variance_ace, PCA_coordinates_ace, loadings_ace,L,S,reconstructed_ace,clus_info_ace,PCA_submatrix_ace = PCA_(EOS,excluded_subtances.union(set(SUBSSS )-set(aceptors)),"aceptors",base_dir)
-        biplot_gen(explained_variance_ace,Aceptors,pca_data_ace,loadings_ace,PC_matrix_ace,PCA_info,"aceptors")
+        biplot_gen(explained_variance_ace,type_dir,pca_data_ace,loadings_ace,PC_matrix_ace,PCA_info,"aceptors")
         group_graphs(PCA_submatrix_ace,Aceptors_cor)
         total_graph(PC_matrix_ace,tot_cor)
     except:
@@ -1252,7 +1454,7 @@ def PCA_region(EOS, type):
     
     try:
         data1, pca_data_cha, PC_matrix_cha, NaN_sheet_global1, Inf_sheet_global1, explained_variance_cha, PCA_coordinates_cha, loadings_cha,L,S,reconstructed_cha,clus_info_cha,PCA_submatrix_cha = PCA_(EOS,excluded_subtances.union(set(SUBSSS )-set(chains)),"chains",base_dir)
-        biplot_gen(explained_variance_cha,Chains,pca_data_cha,loadings_cha,PC_matrix_cha,PCA_info,"chains")
+        biplot_gen(explained_variance_cha,type_dir,pca_data_cha,loadings_cha,PC_matrix_cha,PCA_info,"chains")
         group_graphs(PCA_submatrix_cha,Chains_cor)
         total_graph(PC_matrix_cha,tot_cor)
     except:
@@ -1260,85 +1462,38 @@ def PCA_region(EOS, type):
     
     try:
         data1, pca_data_neu, PC_matrix_neu, NaN_sheet_global1, Inf_sheet_global1, explained_variance_neu, PCA_coordinates_neu, loadings_neu,L,S,reconstructed_neu,clus_info_neu,PCA_submatrix_neu = PCA_(EOS,excluded_subtances.union(set(SUBSSS )-set(neutrals)),"neutrals",base_dir)
-        biplot_gen(explained_variance_neu,Neutrals,pca_data_neu,loadings_neu,PC_matrix_neu,PCA_info,"neutrals")
+        biplot_gen(explained_variance_neu,type_dir,pca_data_neu,loadings_neu,PC_matrix_neu,PCA_info,"neutrals")
         group_graphs(PCA_submatrix_neu,Neutrals_cor)
         total_graph(PC_matrix_neu,tot_cor)
     except:
         pass
+"""
 
-    try:
-        data1, pca_data_rob, PC_matrix_rob, NaN_sheet_global1, Inf_sheet_global1, explained_variance_rob, PCA_coordinates_rob, loadings_rob,LD,SD,reconstructed_rob,clus_info_rob,PCA_submatrix_rob= PCA_(EOS,super_excluded(30),"Robust",base_dir,True)
-        biplot_gen(explained_variance_rob,Robust,pca_data_rob,loadings_rob,PC_matrix_rob,PCA_info,"Robust")
-        group_graphs(PCA_submatrix_rob,Robust_cor)
-        total_graph(PC_matrix_rob,tot_cor)
-    except:
-        pass
+def PCA_region(EOS, type):
+    bip_dir, bar_dir, excel_dir, Robust_cor, Zero_cor, tot_cor, eos_bar, eos_dir, type_dir = file_structurer(base_dir,EOS,type)
+   
+    outliers, NaN_sheet_global, Inf_sheet_global, PCA_info = [pd.DataFrame() for _ in range(4)]
 
+    data, PC_matrix, NaN_sheet_global, Inf_sheet_global,Total_sheet_global, den_sat,fug_sat,sres_sat,hv,vp,Median_sheet_global, Median_sheet_global, Mean_sheet_phases, Median_sheet_phases,Mean_sheet_global,Mean_aceptors_global, Median_aceptors_global, Mean_donors_global, Median_donors_global, Median_chains_global, Mean_chains_global, Median_apolar_global, Mean_apolar_global, Mean_aceptors_phases, Median_aceptors_phases, Mean_donors_phases, Median_donors_phases, Median_chains_phases, Mean_chains_phases, Median_apolar_phases, Mean_apolar_phases  = Matrix_generator(EOS, [], type)
+    fail_rate_global = (NaN_sheet_global + Inf_sheet_global)*100/Total_sheet_global
+
+    substances_nan = set(NaN_sheet_global[NaN_sheet_global.sum(axis=1) > 0].index.tolist())
+    substances_inf = set(Inf_sheet_global[Inf_sheet_global.sum(axis=1) > 0].index.tolist())
     
+    excluded_subtances = substances_nan.union(substances_inf.union(set(["Deuterium","HeavyWater"])))
+    super_excluded = lambda lim: [subs for subs in set(excluded_subtances)-set(["Deuterium","HeavyWater"]) if np.any(fail_rate_global.loc[subs,:] > lim) ] + [subs for subs in fail_rate_global.index.tolist() if fail_rate_global.loc[subs,:].isna().any()]
+    print(excluded_subtances)
+    data1, pca_data_0, PC_matrix_0, NaN_sheet_global, Inf_sheet_global, explained_variance_0, PCA_coordinates_0, loadings_0,L,S,reconstructed_0,clus_info_0,PCA_submatrix_0 = PCA_(EOS,super_excluded(10),"Zero",base_dir)
+    data1, pca_data_rob, PC_matrix_rob, NaN_sheet_global1, Inf_sheet_global1, explained_variance_rob, PCA_coordinates_rob, loadings_rob,LD,SD,reconstructed_rob,clus_info_rob,PCA_submatrix_rob= PCA_(EOS,super_excluded(30),"Robust",base_dir,True)
+    
+    char_gen(eos_bar,den_sat,fug_sat,sres_sat,hv,vp,tot_cor,PCA_submatrix_0,Zero_cor,PCA_submatrix_rob,Robust_cor,explained_variance_rob,explained_variance_0,pca_data_rob,pca_data_0,loadings_rob,PC_matrix_rob,PCA_info,loadings_0,PC_matrix_0,EOS,type_dir)
+    
+
+    excel_filename = os.path.join(excel_dir, f'{EOS} Results.xlsx')
     with pd.ExcelWriter(excel_filename) as writer:
-        loadings_0.to_excel(writer, sheet_name='PC Loadings Zero PCA')
-        loadings.to_excel(writer, sheet_name='PC Loadings First PCA')
-        loadings_sec.to_excel(writer, sheet_name='PC Loadings Second PCA')
-        loadings_ace.to_excel(writer, sheet_name='PC Loadings aceptors')
-        loadings_cha.to_excel(writer, sheet_name='PC Loadings chains')
-        loadings_neu.to_excel(writer, sheet_name='PC Loadings neutrals')
-        loadings_rob.to_excel(writer, sheet_name='PC Loadings Robust')
-        Mean_sheet_global.to_excel(writer, sheet_name='Mean global')
-        Median_sheet_global.to_excel(writer, sheet_name='Median global')
-        Mean_sheet_phases.to_excel(writer, sheet_name='Mean phases')
-        Median_sheet_phases.to_excel(writer, sheet_name='Median phases')
-        Mean_aceptors_global.to_excel(writer, sheet_name='Mean aceptors global')
-        Median_aceptors_global.to_excel(writer, sheet_name='Median aceptors global')
-        Mean_donors_global.to_excel(writer, sheet_name='Mean donors global')
-        Median_donors_global.to_excel(writer, sheet_name='Median donors global')
-        Mean_chains_global.to_excel(writer, sheet_name='Mean chains global')
-        Median_chains_global.to_excel(writer, sheet_name='Median chains global')
-        Mean_apolar_global.to_excel(writer, sheet_name='Mean apolar global')
-        Median_apolar_global.to_excel(writer, sheet_name='Median apolar global')
-        Mean_aceptors_phases.to_excel(writer, sheet_name='Mean aceptors phases')
-        Median_aceptors_phases.to_excel(writer, sheet_name='Median aceptors phases')
-        Mean_donors_phases.to_excel(writer, sheet_name='Mean donors phases')
-        Median_donors_phases.to_excel(writer, sheet_name='Median donors phases')
-        Mean_chains_phases.to_excel(writer, sheet_name='Mean chains phases')
-        Median_chains_phases.to_excel(writer, sheet_name='Median chains phases')
-        Mean_apolar_phases.to_excel(writer, sheet_name='Mean apolar phases')
-        Median_apolar_phases.to_excel(writer, sheet_name='Median apolar phases')
-        reconstructed_0.to_excel(writer, sheet_name='reduced dim zero PCA')
-        reconstructed.to_excel(writer, sheet_name='reduced dim First PCA')
-        reconstructed_sec.to_excel(writer, sheet_name='reduced dim Second PCA')
-        reconstructed_ace.to_excel(writer, sheet_name='reduced dim aceptors')
-        reconstructed_cha.to_excel(writer, sheet_name='reduced dim chains')
-        reconstructed_neu.to_excel(writer, sheet_name='reduced dim neutrals')
-        reconstructed_rob.to_excel(writer, sheet_name='reduced dim  Robust')
-        clus_info_0.to_excel(writer, sheet_name='Clusters zero PCA')
-        clus_info.to_excel(writer, sheet_name='Clusters First PCA')
-        clus_info_sec.to_excel(writer, sheet_name='Clusters Second PCA')
-        clus_info_ace.to_excel(writer, sheet_name='Clusters aceptors')
-        clus_info_cha.to_excel(writer, sheet_name='Clusters chains')
-        clus_info_neu.to_excel(writer, sheet_name='Clusters neutrals') 
-        clus_info_rob.to_excel(writer, sheet_name='Clusters Robust')
-        PCA_coordinates_0.to_excel(writer, sheet_name='Zero PCA coordinates')
-        PCA_coordinates.to_excel(writer, sheet_name='First PCA coordinates')
-        PCA_coordinates_sec.to_excel(writer, sheet_name='second PCA coordinates')
-        PCA_coordinates_ace.to_excel(writer, sheet_name='aceptor PCA coordinates')
-        PCA_coordinates_cha.to_excel(writer, sheet_name='chain PCA coordinates')
-        PCA_coordinates_neu.to_excel(writer, sheet_name='neutrals PCA coordinates')     
-        PCA_coordinates_rob.to_excel(writer, sheet_name='Robust PCA coordinates') 
-        PC_matrix_0.to_excel(writer, sheet_name='PCA Matrix Zero PCA')
-        PC_matrix.to_excel(writer, sheet_name='PCA Matrix First PCA')
-        PC_matrix_sec.to_excel(writer, sheet_name='PCA Matrix second PCA')
-        PC_matrix_ace.to_excel(writer, sheet_name='PCA Matrix aceptors PCA')
-        PC_matrix_cha.to_excel(writer, sheet_name='PCA Matrix chains PCA')
-        PC_matrix_neu.to_excel(writer, sheet_name='PCA Matrix neutrals PCA')
-        PC_matrix_rob.to_excel(writer, sheet_name='PCA Matrix Robust PCA')
-        LD.to_excel(writer, sheet_name='L robust PCA descaled')
-        SD.to_excel(writer, sheet_name='S robust PCA descaled')
-        outliers.to_excel(writer, sheet_name='Outliers first PCA')
-        PCA_info.to_excel(writer, sheet_name='Explained variance')
-        fail_rate_global.to_excel(writer, sheet_name='Fail rates')
-        NaN_sheet_global.to_excel(writer, sheet_name='NaNs')
-        Inf_sheet_global.to_excel(writer, sheet_name='Infs')
-        Excluded_sheet.to_excel(writer, sheet_name='Excluded components')
+        sheets = [(excluded_char,"Density debug"),(loadings_0, 'PC Loadings Zero PCA'),(loadings_rob, 'PC Loadings Robust'),(Mean_sheet_global, 'Mean global'),(Median_sheet_global, 'Median global'),(Mean_sheet_phases, 'Mean phases'),(Median_sheet_phases, 'Median phases'),(Mean_aceptors_global, 'Mean aceptors global'),(Median_aceptors_global, 'Median aceptors global'),(Mean_donors_global, 'Mean donors global'),(Median_donors_global, 'Median donors global'),(Mean_chains_global, 'Mean chains global'),(Median_chains_global, 'Median chains global'),(Mean_apolar_global, 'Mean apolar global'),(Median_apolar_global, 'Median apolar global'),(Mean_aceptors_phases, 'Mean aceptors phases'),(Median_aceptors_phases, 'Median aceptors phases'),(Mean_donors_phases, 'Mean donors phases'),(Median_donors_phases, 'Median donors phases'),(Mean_chains_phases, 'Mean chains phases'),(Median_chains_phases, 'Median chains phases'),(Mean_apolar_phases, 'Mean apolar phases'),(Median_apolar_phases, 'Median apolar phases'),(reconstructed_0, 'reduced dim zero PCA'),(reconstructed_rob, 'reduced dim  Robust'),(clus_info_0, 'Clusters zero PCA'),(clus_info_rob, 'Clusters Robust'),(PCA_coordinates_0, 'Zero PCA coordinates'),(PCA_coordinates_rob, 'Robust PCA coordinates'),(PC_matrix_0, 'PCA Matrix Zero PCA'),(PC_matrix_rob, 'PCA Matrix Robust PCA'),(LD, 'L robust PCA descaled'),(SD, 'S robust PCA descaled'),(outliers, 'Outliers first PCA'),(PCA_info, 'Explained variance'),(fail_rate_global, 'Fail rates'),(NaN_sheet_global, 'NaNs'),(Inf_sheet_global, 'Infs'),(excluded,'Excluded errors')]
+        for df, sheet_name in sheets:
+            df.to_excel(writer, sheet_name=sheet_name)
 
 
 types = ["mean", "median"]
@@ -1351,3 +1506,4 @@ for type in types:
         []
     except:
         pass
+
