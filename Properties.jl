@@ -1,18 +1,28 @@
 using Clapeyron, PyCall, Plots, MAT, JSON
 using Base.Filesystem
 using Statistics
+using PyCall: PyError
 
+
+traceback = pyimport("traceback")
 include("iPCSAFT.jl")
 include("TVTPR.jl")
+include("VTPR.jl")
 
+bisect = pyimport("bisect").bisect
 optimize = pyimport("scipy.optimize")
 CoolProp = pyimport("CoolProp")
 scipy = pyimport("scipy")
 matplotlib = pyimport("matplotlib")
 plt = pyimport("matplotlib.pyplot")
 np = pyimport("numpy")
+curve_fit = pyimport("scipy.optimize").curve_fit
+pe = pyimport("matplotlib.patheffects")
+cm = matplotlib.cm
+colors = pyimport("matplotlib.colors")
+sp_interp = pyimport("scipy.interpolate")
 
-CESs = ["cPR","ADPCSAFT", "BACKSAFT", "Berthelot", "CKSAFT", "Clausius", "CPA", "CPPCSAFT", "PR","DAPT", "EPPR78", "GEPCSAFT" , "GEPCSAFT" , "HeterogcPCPSAFT", "HomogcPCPSAFT", "iPCSAFT", "KU", "LJSAFT","ogSAFT", "PatelTeja", "PCPSAFT", "PCSAFT", "pharmaPCSAFT", "PR78","PSRK", "PTV", "QCPR", "OPCSAFT", "RK", "RKPR","SAFTgammaMie","SAFTVRMie", "SAFTVRMie15", "SAFTVRQMie", "SAFTVRSMie", "SAFTVRSW", "sCKSAFT","sCPA", "softSAFT2016","sPCSAFT", "SRK", "structSAFTgammaMie", "tcPR", "tcRK", "TVTPR", "gcsPCSAFT","TWUSRK", "UMRPR", "vdW", "VTPR"] 
+CESs = ["cPR","ADPCSAFT", "BACKSAFT", "Berthelot", "CKSAFT", "Clausius", "CPA", "CPPCSAFT", "PR","DAPT", "EPPR78", "GEPCSAFT" , "GEPCSAFT" , "HeterogcPCPSAFT", "HomogcPCPSAFT", "iPCSAFT", "KU", "LJSAFT","ogSAFT", "PatelTeja", "PCPSAFT", "PCSAFT", "pharmaPCSAFT", "PR78","PSRK", "PTV", "QCPR", "OPCSAFT", "RK", "RKPR","SAFTgammaMie","SAFTVRMie", "SAFTVRMie15", "SAFTVRQMie", "SAFTVRSMie", "SAFTVRSW", "sCKSAFT","sCPA", "softSAFT2016","sPCSAFT", "SRK", "structSAFTgammaMie", "tcPR", "tcPRW" ,"tcRK", "TVTPR", "gcsPCSAFT","TWUSRK", "UMRPR", "vdW", "VTPR"] 
 
 
 SaftVR = read("Saft_VR_mie.json", String)
@@ -25,7 +35,7 @@ CID = JSON.parse(CIDD)
 #Master_folder = joinpath(@__DIR__,"0.6.10")
 Master_folder = @__DIR__
 
-point_distribution = "linear"
+point_distribution = "log"
 
 function check_and_load_matfiles(compound, CES)
     mat_dir = joinpath(Master_folder, "NPZ_files", CES, "$(CES)_$(compound)")
@@ -53,37 +63,160 @@ function check_and_load_matfiles(compound, CES)
     return data
 end
 
-function initial_guess(Rho, Tsat, Tc, guess, a)
-    Den_sat_model(T, A, B, n) = A * abs(B) .^ (.-(abs.(1 .- T / Tc)).^n)
+function vapor_pressure(T, Tc, Pc, param_values)
+    tau = 1 .- T ./ Tc
+    params = vcat(collect(param_values), zeros(4 - length(param_values)))
+    ln_p = (Tc ./ T) .* (params[1] .* tau .+ params[2] .* tau.^1.5 .+ params[3] .* tau.^2 .+ params[4] .* tau.^4)
+    return Pc .* np.exp.(ln_p)
+end
 
-    Rho_np = np.array(Rho)
-    last_val = Rho_np[np.isfinite(Rho_np)][end]
-    Rho_sca = Rho_np ./last_val
-    T_sca = Tsat
+function vapor_pressure_alt(T, Tc, Pc, param_values)
+    params = vcat(collect(param_values), zeros(6 - length(param_values)))
+    ln_p = params[1] .+ params[2]./(params[3] .+ T) .+ params[4] .* T .+ params[5] .* T .^2 .+ params[6] .* np.log(T)
+    return np.exp.(ln_p)
+end
 
-    if a == ">"
-        Rho_np[Rho_np .> last_val] .= NaN
-    elseif a == "<"
-        Rho_np[Rho_np .< last_val] .= NaN
+function rho_liquid(T, Tc, rho_c, param_values)
+    tau = 1 .- T ./ Tc
+    params = vcat(collect(param_values), zeros(4 - length(param_values)))
+    ln_rho = (params[1] .* tau.^(2/6) .+ params[2] .* tau.^(3/6) .+ params[3] .* tau.^(7/6) .+ params[4] .* tau.^(9/6))
+    return rho_c .* np.exp.(ln_rho)
+end
+
+function rho_altern(T, Tc, rho_c, param_values)
+    params = vcat(collect(param_values), zeros(4 - length(param_values)))
+    rho = rho_c * abs(params[1]) .^ (.-(abs.(1 .- T / Tc)).^params[2] )
+    return rho
+end
+
+function rho_vapor(T, Tc, rho_c, param_values)
+    tau = 1 .- T ./ Tc
+    params = vcat(collect(param_values), zeros(5 - length(param_values)))
+    ln_rho = (params[1] .* tau.^(2/6) .+ params[2] .* tau.^(4/6) .+ params[3] .* tau.^(7/6) .+
+              params[4] .* tau.^(13/6) .+ params[5] .* tau.^(25/6))
+    return rho_c .* np.exp.(ln_rho)
+end
+
+function adjuster_(x,y,fun,N,method)
+    params = Float64[]
+    AAD = 10000000
+    for num_param in 1:N
+        guess = ones(num_param)
+        if length(params) > 0
+            guess[1:length(params)] .= params
+        end
+        result = curve_fit(fun, x, y, guess, maxfev=10000,nan_policy="omit",method=method)
+        params = collect(result[1])
+        pred = fun(x, params...)
+        AAD = sum(abs.(pred .- y)) / length(y)
     end
+    return params,AAD
+end
 
-    Tsat_np = np.array(T_sca)
-    valid = np.isfinite(Rho_sca)
-
-    # Define residual function
-    function residuals(p)
-        A, B, n = p
-        predicted = Den_sat_model(Tsat_np[valid], A, B, n)
-        return predicted - Rho_sca[valid]
+function adjuster(x,y,fun,N)
+    try
+        return adjuster_(x,y,fun,N,"lm")
+    catch
+        try
+            return adjuster_(x,y,fun,N,"trf")
+        catch
+            return adjuster_(x,y,fun,N,"dogbox")
+        end
     end
+end 
 
-    lower_bounds = np.array([0, 0, 0])
-    upper_bounds = np.array([1e10, 1e10, 1e10])
 
-    result = optimize.least_squares(residuals, guess, bounds=(lower_bounds, upper_bounds), max_nfev=100000)
+function fit_vapor_pressure(Tc, Pc, T, P_sat, CES, subs; print_AAD=false, plot=false)
+    mat_dir = joinpath(Master_folder, "Figures", CES, "$(CES)_$(subs)")
+    ensure_directory_exists(mat_dir)
+    AAD,params,Psat_fun = nothing, nothing, nothing
+    wrapper(T, p...) = vapor_pressure(T, Tc, Pc, p)
+    wrapper_alt(T, p...) = vapor_pressure_alt(T, Tc, Pc, p)
+
+    plt.plot(T, P_sat, "y-", label="p_sat")
+    plt.legend()
+
+    mask_below_Tc = T .< Tc    
+    mask_T_min = T .> Tc * 0
+    is_not_nan = np.isfinite(P_sat)
+
+    P_sat = P_sat[mask_below_Tc][mask_T_min][is_not_nan]
+    T = T[mask_below_Tc][mask_T_min][is_not_nan]
+
+    P_sat = np.append(P_sat, [Pc])
+    T = np.append(T, [Tc])
     
-    fit(T) = Den_sat_model(T, result["x"][1]*last_val, result["x"][2], result["x"][3]) 
-    return fit
+    try
+        params,AAD = adjuster(T,P_sat,wrapper,4)
+        plt.plot(T, wrapper(T, params...), "k--", label="p_sat fit")
+        Psat_fun(T) = wrapper(T, params...)
+        test = Psat_fun(Tc)
+        if test == 0 || !isfinite(test)
+            throw("Wrong Wagner adjust")
+        end
+    catch
+        try
+            params,AAD = adjuster(T,P_sat,wrapper_alt,6)
+            plt.plot(T, wrapper_alt(T, params...), "k--", label="p_sat fit")
+            Psat_fun(T) = wrapper_alt(T, params...)
+            #println("Second Psat = $(params)")
+        catch
+            plt.savefig(joinpath(mat_dir, "vp fits.png"), dpi=600)
+            plt.close()
+        end
+    end
+    plt.savefig(joinpath(mat_dir, "vp fits.png"), dpi=600)
+    plt.close()
+
+    return Psat_fun
+end
+
+function fit_densities(Tc, rho_c, T, rho_sat_vapor, rho_sat_liquid, CES, subs; print_AAD=false, plot=false)
+
+    f_liq,f_vap,liquid_params,vapor_params = nothing, nothing, nothing, nothing
+
+    wrap_liq(T, p...) = rho_liquid(T, Tc, rho_c, p)
+    wrap_vap(T, p...) = rho_vapor(T, Tc, rho_c, p)
+    wrap_alt(T, p...) = rho_altern(T, Tc, rho_c, p)
+
+    mask_below_Tc = T .< Tc
+    mask_T_min = T .> Tc * 0
+    is_not_nan = np.isfinite(rho_sat_liquid) .& np.isfinite(rho_sat_vapor)
+
+    T = T[mask_below_Tc][mask_T_min][is_not_nan]
+    rho_sat_liquid = rho_sat_liquid[mask_below_Tc][mask_T_min][is_not_nan]
+    rho_sat_vapor = rho_sat_vapor[mask_below_Tc][mask_T_min][is_not_nan]
+    mat_dir = joinpath(Master_folder, "Figures", CES, "$(CES)_$(subs)")
+
+
+    try
+        liquid_params,AAD = adjuster(T,rho_sat_liquid,wrap_liq,4)
+        f_liq = T -> wrap_liq(T, liquid_params...)
+    catch
+        liquid_params,AAD = adjuster(T,rho_sat_liquid,wrap_alt,2)
+        f_liq = T -> wrap_alt(T, liquid_params...)
+    end
+
+    try
+        vapor_params,AAD = adjuster(T,rho_sat_vapor,wrap_vap,5)
+        f_vap = T -> wrap_vap(T, vapor_params...)
+
+    catch
+        vapor_params,AAD = adjuster(T,rho_sat_vapor,wrap_alt,2)
+        f_vap = T -> wrap_alt(T, vapor_params...)
+    end
+
+    if plot
+        plt.plot(T,rho_sat_liquid,  "g--", label="liquid")
+        plt.plot(T,rho_sat_vapor, "b--", label="vapor")
+        plt.plot(T,wrap_liq(T, liquid_params...), "g", label="liquid fit")
+        plt.plot(T,wrap_vap(T, vapor_params...), "b", label="vapor fit")
+        plt.legend()
+        plt.savefig(joinpath(mat_dir, "Density fits.png"))
+        plt.close()
+    end
+
+    return f_liq, f_vap
 end
 
 function ensure_directory_exists(dir_path::String)
@@ -117,7 +250,7 @@ end
 
 function Initiator(CES, Name)
     if CES == "SAFTVRMie"
-        Parameters, Mw1, H, e = SAFTVR_get(Name)
+        Parameters, Mw, H, e = SAFTVR_get(Name)
         if Parameters["epsilonAB"] != "\u2014\u2014"
             a = float(Parameters["epsilonAB"])
             b = float(Parameters["kAB "])
@@ -125,9 +258,8 @@ function Initiator(CES, Name)
             a = 0
             b = 0
         end
-
         model = SAFTVRMie([Name]; userlocations=(;
-            Mw = [Mw1],
+            Mw = [Mw],
             segment = [float(Parameters["m"])],
             sigma = [float(Parameters["sigma"])],
             epsilon = [float(Parameters["epsilon"])],
@@ -139,245 +271,206 @@ function Initiator(CES, Name)
             bondvol = Dict(((Name, "e"), (Name, "H")) => b * 10^-30)
         ))
     else
-        model = eval(Meta.parse(CES * "([\"" * Name * "\"])"))
+        mixing = vdW1fRule(Name)
+        model = eval(Meta.parse("$(CES)([\"$(Name)\"])"))
     end
     return model
 end
-Tc = 0
-function density_CES(compound, CES; T_shift = 0.0)
-    global Tc
 
-    N = 500
-
-    handle = CoolProp.AbstractState("HEOS", compound)
-
+function limit_creator(handle,point_distribution,N,T_shift)
     pc = CoolProp.AbstractState.p_critical(handle)
     Tmax = CoolProp.AbstractState.Tmax(handle)
-
+    
     handle.update(CoolProp.QT_INPUTS, 0, CoolProp.AbstractState.Tmin(handle))
 
-    pmin = handle.p()
+    pmin = max(0.001 * pc, handle.p())
     pmax = CoolProp.AbstractState.pmax(handle)
 
     if pmin == handle.p()
         Tmin = CoolProp.AbstractState.Tmin(handle) + T_shift
     else
         try
-            handle.update(CoolProp.PQ_INPUTS, pmin * 100, 1)
-            Tmin = max(CoolProp.AbstractState.Tmin(handle), handle.T() - 50) + T_shift
+            handle.update(CoolProp.PQ_INPUTS, pmin*100, 1)
+            Tmin = max(CoolProp.AbstractState.Tmin(handle), handle.T()-50) + T_shift
         catch
-            Tmin = CoolProp.AbstractState.Tmin(handle) + T_shift
+            Tmin = CoolProp.AbstractState.Tmin(handle)+T_shift
         end
     end
-    Tc = CoolProp.AbstractState.T_critical(handle)
-    println("Tc = ",Tc)
-    Tcr = CoolProp.AbstractState.T_critical(handle)
-    model = Initiator(CES, compound)
-
+    
     if point_distribution=="linear"
         P = collect(LinRange(pmin, pmax, N))
     elseif point_distribution=="log"
         P = exp10.(LinRange(log10(pmin), log10(pmax), N))
     end
+
     T = LinRange(Tmin, Tmax, N)
-    Tsat = [t for t in T if t < Tc]
+    return np.array(T),np.array(P)
+end
 
-    Rho_CES = fill(NaN, length(T), length(P))
-    Phi_CES = zeros(Float64, length(T), length(P))
-    Sres_CES = zeros(Float64, length(T), length(P))
-    Rho_sat_liq_CES = zeros(length(Tsat))
-    Phi_sat_liq_CES = zeros(length(Tsat))
-    Sres_sat_liq_CES = zeros(length(Tsat))
-    Rho_sat_vap_CES = zeros(length(Tsat))
-    Phi_sat_vap_CES = zeros(length(Tsat))
-    Sres_sat_vap_CES = zeros(length(Tsat))
-    pv_CES = zeros(length(Tsat))
-    Hv_CES = zeros(length(Tsat))
+function Error_spliter(Matrix, vp_CES, N, P, T, Tc_CES, Pc_CES, Tsat_CES , Psat_adj)
 
-    v0 = nothing
-    pv = nothing
+    nan_index = findall(!, isfinite.(vp_CES))
     
-    Den_sat_model(T, A, B, n) = A * B .^ (.-(abs.(1 .- T ./ Tc)).^ n)
-    (Tc, pc, vc) = crit_pure(model)
+    if !isempty(nan_index)
+        nan_index = np.where(np.isnan(vp_CES))[1]
 
-    for (t_idx, t) in enumerate(T)
-        if t in Tsat
+        for index in nan_index
+            Tsel = Tsat_CES[index + 1]
+            Ppre = Psat_adj(Tsel)
 
-            if t == T[1]
-                (pv, vl, vv) = saturation_pressure(model, t)
-            else
-                (pv, vl, vv) = saturation_pressure(model, t)
-                
-                if isnan(vl) || isinf(vl)
-                    (pv, vl, vv) = saturation_pressure(model, t, IsoFugacitySaturation(p0 = pv, vl = v0[2], vv = v0[1]))
-                    if isnan(vl) || isinf(vl)
-                        (pv, vl, vv) = saturation_pressure(model, t, v0 = (v0[2], v0[1]))
-                        if isnan(vl) || isinf(vl)
-                            (pv, vl, vv) = saturation_pressure(model, t, v0 = (1.3 * v0[2], 1.4 * v0[1]))
-                        end
-                    end
-                end
-                
-            end
-
-            if vl > vv
-                vl, vv = vv, vl
-            end
-
-            hl = Clapeyron.VT_enthalpy(model, vl, t, [1.])
-            hv = Clapeyron.VT_enthalpy(model, vv, t, [1.])
-            v0 = (vl, vv)
-
-            Rho_sat_liq_CES[t_idx] = 1 / vl
-            Rho_sat_vap_CES[t_idx] = 1 / vv
-            Phi_sat_liq_CES[t_idx] = Clapeyron.VT_fugacity_coefficient(model, vl, t, [1.])[1]
-            Phi_sat_vap_CES[t_idx] = Clapeyron.VT_fugacity_coefficient(model, vv, t, [1.])[1]
-            Sres_sat_liq_CES[t_idx] = Clapeyron.VT_entropy_res(model, vl, t, [1.])
-            Sres_sat_vap_CES[t_idx] = Clapeyron.VT_entropy_res(model, vv, t, [1.])
-            Hv_CES[t_idx] = hv - hl
-            pv_CES[t_idx] = pv
-
-            handle.update(CoolProp.QT_INPUTS, 0, t)
-        end
-
-        for (p_idx, pr) in enumerate(P)
-            if pr < pc && t < Tc
-                if pr < pv
-                    density_value = 1 / volume(model, pr, t; phase = :vapor)
-                    
-                    if isnan(density_value) || isinf(density_value)
-                        density_value = 1 / volume(model, pr, t, vol0 = 1 / average_surrounding(Rho_CES, t_idx, p_idx); phase = :vapor)
-                    end
-                    
-                else
-                    density_value = 1 / volume(model, pr, t; phase = :liquid)
-                    
-                    if isnan(density_value) || isinf(density_value)
-                        density_value = 1 / volume(model, pr, t, vol0 = 1 / average_surrounding(Rho_CES, t_idx, p_idx); phase = :liquid)
-                    end
-                    
-                end
-            else
-                density_value = 1 / volume(model, pr, t,)
-                
-                if isnan(density_value) || isinf(density_value)
-                    density_value = 1 / volume(model, pr, t, vol0 = 1 / average_surrounding(Rho_CES, t_idx, p_idx))
-                end
-                
-            end
-
-            Rho_CES[t_idx, p_idx] = density_value
-            Sres_CES[t_idx, p_idx] = Clapeyron.VT_entropy_res(model, 1 / density_value, t, [1.])
-            Phi_CES[t_idx, p_idx] = Clapeyron.VT_fugacity_coefficient(model, 1 / density_value, t, [1.])[1]
+            vp_CES[index + 1] = Psat_adj(Tsel)
         end
     end
+
+    Pc_ind = bisect(P, Pc_CES) + 1
+    Tc_ind = bisect(T, Tc_CES) + 1
+    vp_ind = [bisect(P, i) + 1 for i in vp_CES]
+
+    mask_supercritical = fill(false, size(Matrix))
+    mask_liquid = fill(false, size(Matrix))
+    mask_gas = fill(false, size(Matrix))
+
+    mask_supercritical[1:N, Pc_ind+1:N] .= true
+    mask_gas[Tc_ind:N, 1:Pc_ind] .= true
+
+    for (vp_i, T_CES) in zip(vp_ind, Tsat_CES)
+        Tsat_ind = bisect(T, T_CES)
+        mask_gas[Tsat_ind, 1:vp_i] .= true
+        mask_liquid[Tsat_ind, vp_i+1:Pc_ind] .= true
+    end
+
+    regions = Dict(
+        "supercritical" => mask_supercritical,
+        "gas" => mask_gas,
+        "liquid" => mask_liquid
+    )
+
+    return regions
+end
+
+
+function interpolate_zone(Rho_CES,T,P; method::String="linear")
+    valid_mask = np.isfinite(Rho_CES)
+    nan_mask = .!np.isfinite(Rho_CES)
+
+    points = np.column_stack((np.ravel(T[valid_mask]), np.ravel(P[valid_mask])))
+    points_all = np.column_stack((np.ravel(T), np.ravel(P)))
+    xi = np.column_stack((np.ravel(T[nan_mask]), np.ravel(P[nan_mask])))
+    values = np.ravel(Rho_CES[valid_mask])
+    interpolated_ = sp_interp.griddata(points,values,points_all, method=method)
+    complete_matrix = reshape(interpolated_, size(Rho_CES))
+    return complete_matrix 
+end
+
+function neighbor_filler(Tsat, Rho_sat_liq_CES, Rho_sat_vap_CES, pv_CES, model)
+    is_nan = .!isfinite.(Rho_sat_liq_CES) .| .!isfinite.(Rho_sat_vap_CES)
     
-    for (t_ind, t) in enumerate(Iterators.reverse(Tsat))
-        idx = length(Tsat) - t_ind + 1
+    filled = falses(length(Tsat))
+    queue = np.where(is_nan)[1]
+    queue = queue .+ 1
 
-        if (!(isnan(Rho_sat_liq_CES[idx]) || isnan(Rho_sat_vap_CES[idx]) || isinf(Rho_sat_liq_CES[idx]) || isinf(Rho_sat_vap_CES[idx])))
+    while !isempty(queue)
+        i = pop!(queue)
+
+        # Skip if already filled
+        if !is_nan[i] || filled[i]
             continue
-        else
-            prev_idx = idx + 1
-            if prev_idx <= length(Tsat)
-                (pv, vl, vv) = saturation_pressure(model, t, IsoFugacitySaturation(p0 = pv_CES[prev_idx], vl = 1 / Rho_sat_liq_CES[prev_idx], vv = 1 / Rho_sat_vap_CES[prev_idx]))
-                if isnan(vl) || isnan(vv)
-                    (pv, vl, vv) = saturation_pressure(model, t, v0 = (1 / Rho_sat_liq_CES[prev_idx], 1 / Rho_sat_vap_CES[prev_idx]))
-                end
-            else
-                (pv, vl, vv) = saturation_pressure(model, t)
+        end
+
+        # Try using neighbor(s) as initial guesses
+        initial_p = nothing
+        initial_vl = nothing
+        initial_vv = nothing
+
+        # Priority: use closest filled neighbors
+        for offset in (-1, 1)
+            j = i + offset
+            if j >= 1 && j <= length(Tsat) && isfinite(Rho_sat_liq_CES[j]) && isfinite(Rho_sat_vap_CES[j])
+                initial_p = pv_CES[j]
+                initial_vl = Rho_sat_liq_CES[j]
+                initial_vv = Rho_sat_vap_CES[j]
+                break
             end
         end
 
-        Rho_sat_liq_CES[idx] = 1 / vl
-        Rho_sat_vap_CES[idx] = 1 / vv
-        Phi_sat_liq_CES[idx] = Clapeyron.VT_fugacity_coefficient(model, vl, t, [1.])[1]
-        Phi_sat_vap_CES[idx] = Clapeyron.VT_fugacity_coefficient(model, vv, t, [1.])[1]
-        Sres_sat_liq_CES[idx] = Clapeyron.VT_entropy_res(model, vl, t, [1.])
-        Sres_sat_vap_CES[idx] = Clapeyron.VT_entropy_res(model, vv, t, [1.])
-        hv = Clapeyron.VT_enthalpy(model, vv, t, [1.])
-        hl = Clapeyron.VT_enthalpy(model, vl, t, [1.])
-        Hv_CES[idx] = hv - hl
-        pv_CES[idx] = pv
-    end
-
-    liq = initial_guess(Rho_sat_liq_CES,Tsat, Tcr,(0.5, 0.5, 0.7),"<")
-    vap = initial_guess(Rho_sat_vap_CES,Tsat, Tcr,(0.97, 100, 0.75),">")
-
-    for (t_ind, t) in enumerate(Tsat)
-        idx = t_ind
-        if (!(isnan(Rho_sat_liq_CES[idx]) || isnan(Rho_sat_vap_CES[idx]) || isinf(Rho_sat_liq_CES[idx]) || isinf(Rho_sat_vap_CES[idx])))
+        if initial_p === nothing
             continue
-        else
-            println("vl0 = ",liq(t))
-            println("vv0 = ",vap(t))
-            (pv, vl, vv) = saturation_pressure(model, t, v0 = (liq(t),vap(t)))
-            println("vl = ",vl)
-            println("vv = ",vv)
-
         end
 
-        Rho_sat_liq_CES[idx] = 1 / vl
-        Rho_sat_vap_CES[idx] = 1 / vv
-        Phi_sat_liq_CES[idx] = Clapeyron.VT_fugacity_coefficient(model, vl, t, [1.])[1]
-        Phi_sat_vap_CES[idx] = Clapeyron.VT_fugacity_coefficient(model, vv, t, [1.])[1]
-        Sres_sat_liq_CES[idx] = Clapeyron.VT_entropy_res(model, vl, t, [1.])
-        Sres_sat_vap_CES[idx] = Clapeyron.VT_entropy_res(model, vv, t, [1.])
-        hv = Clapeyron.VT_enthalpy(model, vv, t, [1.])
-        hl = Clapeyron.VT_enthalpy(model, vl, t, [1.])
-        Hv_CES[idx] = hv - hl
-        pv_CES[idx] = pv
+        try
+            pv, vl, vv = saturation_pressure(
+                model,
+                Tsat[i],
+                IsoFugacitySaturation(p0 = initial_p, vl = initial_vl, vv = initial_vv)
+            )
+
+            pv_CES[i] = pv
+            Rho_sat_liq_CES[i] = vl
+            Rho_sat_vap_CES[i] = vv
+            filled[i] = true
+            is_nan[i] = false
+
+            # Add neighboring NaNs to queue
+            for offset in (-1, 1)
+                j = i + offset
+                if j >= 1 && j <= length(Tsat) && is_nan[j] && !(j in queue)
+                    push!(queue, j)
+                end
+            end
+        catch
+            continue  # skip if saturation_pressure fails
+        end
     end
 
+    return pv_CES, Rho_sat_liq_CES, Rho_sat_vap_CES
+end
 
+
+function interpolator(Rho_CES::Array{<:Real,2}, T::Vector{<:Real}, P::Vector{<:Real},vp_CES , Tc_CES, Pc_CES , Tsat_CES, Psat_adj; method::String="linear")
+    Pgrid, Tgrid = np.meshgrid(P, T)
+    regions = Error_spliter(Rho_CES, vp_CES, 500,P,T , Tc_CES, Pc_CES, Tsat_CES,Psat_adj)
+    sup_matrix = interpolate_zone(Rho_CES[regions["supercritical"]],Tgrid[regions["supercritical"]],Pgrid[regions["supercritical"]]; method=method)
+    gas_matrix = interpolate_zone(Rho_CES[regions["gas"]],Tgrid[regions["gas"]],Pgrid[regions["gas"]]; method=method)
+    liq_matrix = interpolate_zone(Rho_CES[regions["liquid"]],Tgrid[regions["liquid"]],Pgrid[regions["liquid"]]; method=method)
+    inter = np.zeros(np.shape(Rho_CES))
+    inter[regions["supercritical"]] = sup_matrix
+    inter[regions["gas"]] = gas_matrix
+    inter[regions["liquid"]] = liq_matrix
     
-    ### Removable part 
-    """
-    for (t_ind, t) in enumerate(Tsat)
-        idx = t_ind
-        println(!(isnan(Rho_sat_liq_CES[idx]) || isnan(Rho_sat_vap_CES[idx]) || isinf(Rho_sat_liq_CES[idx]) || isinf(Rho_sat_vap_CES[idx])))
-        if !(isnan(Rho_sat_liq_CES[idx]) || isnan(Rho_sat_vap_CES[idx]) || isinf(Rho_sat_liq_CES[idx]) || isinf(Rho_sat_vap_CES[idx]))
-            continue
-        else
-            handle.update(CoolProp.QT_INPUTS, 0, t)
-            vl0 = 1/handle.rhomolar()
+    return inter
+end
 
-            handle.update(CoolProp.QT_INPUTS, 1, t)
-            vv0 = 1/handle.rhomolar()
-            (pv, vl, vv) = saturation_pressure(model, t, v0 = (vl0,vv0))
-        end
 
-        Rho_sat_liq_CES[idx] = 1 / vl
-        Rho_sat_vap_CES[idx] = 1 / vv
-        Phi_sat_liq_CES[idx] = Clapeyron.VT_fugacity_coefficient(model, vl, t, [1.])[1]
-        Phi_sat_vap_CES[idx] = Clapeyron.VT_fugacity_coefficient(model, vv, t, [1.])[1]
-        Sres_sat_liq_CES[idx] = Clapeyron.VT_entropy_res(model, vl, t, [1.])
-        Sres_sat_vap_CES[idx] = Clapeyron.VT_entropy_res(model, vv, t, [1.])
-        hv = Clapeyron.VT_enthalpy(model, vv, t, [1.])
-        hl = Clapeyron.VT_enthalpy(model, vl, t, [1.])
-        Hv_CES[idx] = hv - hl
-        pv_CES[idx] = pv
-    end
-    """
-    for tEOS in CESs
-        surrogate_model = nothing
+function fitter_filler(model,Tsat,Rho_sat_liq_CES,Rho_sat_vap_CES,Phi_sat_liq_CES,Phi_sat_vap_CES,Sres_sat_liq_CES,Sres_sat_vap_CES,Hv_CES,pv_CES,Vc,Tc, Pc, CES, compound)
+    Rho_sat_liq_CES[Rho_sat_liq_CES .< 1/Vc] .= NaN
+    Rho_sat_vap_CES[Rho_sat_vap_CES .> 1/Vc] .= NaN
+
+
+
+    P_fit,liq, vap = nothing, nothing, nothing
+    if any(np.isnan(Rho_sat_liq_CES)) || any(np.isnan(Rho_sat_vap_CES)) || any(np.isinf(Rho_sat_liq_CES)) || any(np.isinf(Rho_sat_vap_CES))
+        P_fit = fit_vapor_pressure(Tc, Pc, Tsat, pv_CES, CES, compound; print_AAD=false, plot=true)
+        #println(Tc, 1/Vc, Tsat, Rho_sat_vap_CES, Rho_sat_liq_CES, CES)
+        liq, vap = fit_densities(Tc, 1/Vc, Tsat, Rho_sat_vap_CES, Rho_sat_liq_CES, CES, compound; print_AAD=false, plot=true) 
+
         for (t_ind, t) in enumerate(Tsat)
             idx = t_ind
             if (!(isnan(Rho_sat_liq_CES[idx]) || isnan(Rho_sat_vap_CES[idx]) || isinf(Rho_sat_liq_CES[idx]) || isinf(Rho_sat_vap_CES[idx])))
                 continue
             else
-                try
-                    surrogate_model = Initiator(tEOS, compound)
-                catch
-                    continue
-                end
-                (pv, tvl, tvv) = saturation_pressure(surrogate_model, t)
-                if isnan(tvl) || isnan(tvv)
-                    continue
-                end
-                (pv, vl, vv) = saturation_pressure(model, t, v0 = (tvl,tvv))
-                if isnan(vl) || isnan(vv)
-                    continue
+                (pv, vl, vv) = saturation_pressure(model, t, IsoFugacitySaturation(p0 = P_fit(t), vl = liq(t), vv = vap(t)))
+                if isnan(vv)
+                    (pv, vl, vv) = saturation_pressure(model, t, ChemPotVSaturation(vl = liq(t), vv = vap(t)))
+                    if isnan(vv)
+                        (pv, vl, vv) = saturation_pressure(model, t, IsoFugacitySaturation(p0 = pv_CES[t_ind-1], vl = liq(t), vv = vap(t)))                    
+                        if isnan(vv)
+                            try 
+                                (pv, vl, vv) = saturation_pressure(model, t, IsoFugacitySaturation(p0 = pv_CES[t_ind+1], vl = liq(t), vv = vap(t)))                    
+                            catch BoundsError
+                                (pv, vl, vv) = saturation_pressure(model, t, IsoFugacitySaturation(p0 = Pc*(t/Tc), vl = liq(t), vv = vap(t)))       
+                            end
+                        end
+                    end
                 end
             end
 
@@ -392,78 +485,152 @@ function density_CES(compound, CES; T_shift = 0.0)
             Hv_CES[idx] = hv - hl
             pv_CES[idx] = pv
         end
-
     end
-    
-    for (t_idx, t) in enumerate(T)
-        for (p_idx, pr) in enumerate(P)
-            if isnan(Rho_CES[t_idx, p_idx]) || isinf(Rho_CES[t_idx, p_idx])
-                density_value = 1 / volume(model, pr, t, vol0 = 1 / average_surrounding(Rho_CES, t_idx, p_idx))
-                Rho_CES[t_idx, p_idx] = density_value
-                Sres_CES[t_idx, p_idx] = Clapeyron.VT_entropy_res(model, 1 / density_value, t, [1.])
-                Phi_CES[t_idx, p_idx] = Clapeyron.VT_fugacity_coefficient(model, 1 / density_value, t, [1.])[1]
-            end
-        end
-    end
+    return Rho_sat_liq_CES,Rho_sat_vap_CES,Phi_sat_liq_CES,Phi_sat_vap_CES,Sres_sat_liq_CES,Sres_sat_vap_CES,Hv_CES,pv_CES,P_fit,liq, vap
+end
 
-    N = 10
-
-    for x_bias in -N:N
-        for y_bias in -N:N
-            for (t_idx, t) in enumerate(T)
-                for (p_idx, pr) in enumerate(P)
-                    if (y_bias == 0 && x_bias == 0) || (!isnan(Rho_CES[t_idx, p_idx]) && !isinf(Rho_CES[t_idx, p_idx]))
+function interpolator_filler(Rho_CES,T, P,pv_CES,Tc, Pc, Tsat,CES, compound,model,Sres_CES,Phi_CES )
+    if any(np.isnan(Rho_CES)) || any(np.isinf(Rho_CES))
+        P_fit = fit_vapor_pressure(Tc, Pc, Tsat, pv_CES, CES, compound; print_AAD=false, plot=true)
+        #Rho_pre_linear = interpolator(Rho_CES, T, P,pv_CES , Tc, Pc , Tsat,P_fit)
+        #Rho_pre_cubic = interpolator(Rho_CES, T, P,pv_CES , Tc, Pc , Tsat,P_fit,method="cubic")
+        Rho_pre_near = interpolator(Rho_CES, T, P,pv_CES , Tc, Pc , Tsat,P_fit,method="nearest")
+        Tmis, Pmis,Tmis_idx,Pmis_idx = [],[],[],[]
+        for (t_idx, t) in enumerate(T)
+            for (p_idx, p) in enumerate(P)
+                if  isfinite(Rho_CES[t_idx, p_idx]) 
+                    continue
+                elseif !np.isfinite(Rho_CES[t_idx, p_idx])
+                    predicted = Rho_pre_near[t_idx,p_idx]
+                    if !np.isfinite(Rho_CES[t_idx, p_idx])
                         continue
+                    end             
+                
+                    volume_calc = volume(model, p, t, vol0 = 1 /predicted  )
+                    if isnan(volume_calc)
+                        volume_calc = volume(model, p, t, vol0 = 1 /Rho_pre_linear[t_idx,p_idx])
+                        if isnan(volume_calc)
+                            volume_calc = volume(model, p, t, vol0 = 1 /Rho_pre_near[t_idx,p_idx])
+                        end
                     end
-                    if isnan(Rho_CES[t_idx, p_idx]) || !isinf(Rho_CES[t_idx, p_idx])
-                        density_value = 1 / volume(model, pr, t, vol0 = 1 / Rho_CES[min(500, max(1, t_idx + x_bias)), min(500, max(1, p_idx + y_bias))])
-                        Rho_CES[t_idx, p_idx] = density_value
-                        Sres_CES[t_idx, p_idx] = Clapeyron.VT_entropy_res(model, 1 / density_value, t, [1.])
-                        Phi_CES[t_idx, p_idx] = Clapeyron.VT_fugacity_coefficient(model, 1 / density_value, t, [1.])[1]
+
+                    density_value = 1 / volume_calc 
+                    if !np.isfinite(density_value)
+                        push!(Tmis,t)
+                        push!(Pmis,p)
+                        push!(Tmis_idx,t_idx)
+                        push!(Pmis_idx,p_idx)
                     end
+                    Rho_CES[t_idx, p_idx] = density_value
+                    Sres_CES[t_idx, p_idx] = Clapeyron.VT_entropy_res(model, 1 / density_value, t, [1.])
+                    Phi_CES[t_idx, p_idx] = Clapeyron.VT_fugacity_coefficient(model, 1 / density_value, t, [1.])[1]
+                
                 end
             end
         end
-    end
 
-    for x_bias in -N:N
-        for y_bias in -N:N
-            for (t_idx, t) in enumerate(T)
-                for (p_idx, pr) in enumerate(P)
-                    if (y_bias == 0 && x_bias == 0) || (!isnan(Rho_CES[t_idx, p_idx]) && !isinf(Rho_CES[t_idx, p_idx]))
-                        continue
-                    end
-                    if isnan(Rho_CES[t_idx, p_idx]) || !isinf(Rho_CES[t_idx, p_idx])
-                        density_value = 1 / volume(model, pr, t, vol0 = 1 / Rho_CES[min(500, max(1, t_idx + x_bias)), min(500, max(1, p_idx + y_bias))])
-                        Rho_CES[t_idx, p_idx] = density_value
-                        Sres_CES[t_idx, p_idx] = Clapeyron.VT_entropy_res(model, 1 / density_value, t, [1.])
-                        Phi_CES[t_idx, p_idx] = Clapeyron.VT_fugacity_coefficient(model, 1 / density_value, t, [1.])[1]
-                    end
+        if any(np.isnan(Rho_CES)) || any(np.isinf(Rho_CES))
+            Rho_pre = interpolator(Rho_CES, T, P,pv_CES , Tc, Pc , Tsat, P_fit)
+            for (t,p,t_idx,p_idx) in zip(Tmis,Pmis,Tmis_idx,Pmis_idx)
+                predicted = Rho_pre_cubic[t_idx,p_idx]
+                if !np.isfinite(predicted)
+                    predicted = Rho_pre_linear[t_idx,p_idx]
+                    if !np.isfinite(predicted)
+                        predicted = Rho_pre_near[t_idx,p_idx]
+                        if !np.isfinite(predicted)
+                            continue
+                        end
+                    end                
                 end
-            end
-        end
-    end
-
-    for (t_idx, t) in enumerate(T)
-        for (p_idx, pr) in enumerate(P)
-            if isnan(Rho_CES[t_idx, p_idx]) || isinf(Rho_CES[t_idx, p_idx])
-                density_value = 1 / volume(model, pr, t, vol0 = 1 / average_surrounding(Rho_CES, t_idx, p_idx))
+                density_value = 1 / volume(model, p, t, vol0 = 1 / predicted)
                 Rho_CES[t_idx, p_idx] = density_value
                 Sres_CES[t_idx, p_idx] = Clapeyron.VT_entropy_res(model, 1 / density_value, t, [1.])
                 Phi_CES[t_idx, p_idx] = Clapeyron.VT_fugacity_coefficient(model, 1 / density_value, t, [1.])[1]
+
             end
         end
     end
-    
+    return Rho_CES, Sres_CES, Phi_CES
+end
+
+function density_CES(compound, CES; T_shift = 0.0)
+
+    N = 500
+
+    handle = CoolProp.AbstractState("HEOS", compound)
+    model = Initiator(CES, compound)
+
+ 
+    T,P = limit_creator(handle,point_distribution,N,T_shift)
+
+    (Tc, Pc, Vc) = crit_pure(model)
+    Tsat = T[T .< Tc] 
+    #println("Tc = $(Tc)")
+    Rho_CES, Phi_CES, Sres_CES, Rho_sat_liq_CES, Phi_sat_liq_CES, Sres_sat_liq_CES, Rho_sat_vap_CES, Phi_sat_vap_CES, Sres_sat_vap_CES, pv_CES, Hv_CES = fill(NaN, length(T), length(P)), zeros(Float64, length(T), length(P)), zeros(Float64, length(T), length(P)), zeros(length(Tsat)), zeros(length(Tsat)), zeros(length(Tsat)), zeros(length(Tsat)), zeros(length(Tsat)), zeros(length(Tsat)), zeros(length(Tsat)), zeros(length(Tsat))
+    for (t_idx, t) in enumerate(T)
+        if t in Tsat
+            #println("t = $(t)")
+            (pv, vl, vv) = saturation_pressure(model, t)
+
+
+            if vl > vv
+                vl, vv = vv, vl
+            end
+
+            hl = Clapeyron.VT_enthalpy(model, vl, t, [1.])
+            hv = Clapeyron.VT_enthalpy(model, vv, t, [1.])
+
+            Rho_sat_liq_CES[t_idx] = 1 / vl
+            Rho_sat_vap_CES[t_idx] = 1 / vv
+            Phi_sat_liq_CES[t_idx] = Clapeyron.VT_fugacity_coefficient(model, vl, t, [1.])[1]
+            Phi_sat_vap_CES[t_idx] = Clapeyron.VT_fugacity_coefficient(model, vv, t, [1.])[1]
+            Sres_sat_liq_CES[t_idx] = Clapeyron.VT_entropy_res(model, vl, t, [1.])
+            Sres_sat_vap_CES[t_idx] = Clapeyron.VT_entropy_res(model, vv, t, [1.])
+            Hv_CES[t_idx] = hv - hl
+            pv_CES[t_idx] = pv
+        end
+
+        for (p_idx, p) in enumerate(P)
+            if p < Pc && t < Tc
+                if p < pv
+                    density_value = 1 / volume(model, p, t; phase = :vapor) 
+                else
+                    density_value = 1 / volume(model, p, t; phase = :liquid)
+                end
+            else
+                density_value = 1 / volume(model, p, t)
+            end
+            if isnan(density_value)
+                try
+                    density_value = 1 / volume(model, p, t,vol0 = 1 /Rho_CES[t_idx, p_idx-1])
+                catch
+                    density_value = 1 / volume(model, p, t,vol0 = 1 /Rho_CES[t_idx, p_idx+1])
+                end
+            end
+            #println("density_value = $(density_value)")
+            Rho_CES[t_idx, p_idx] = density_value
+            Sres_CES[t_idx, p_idx] = Clapeyron.VT_entropy_res(model, 1 / density_value, t, [1.])
+            Phi_CES[t_idx, p_idx] = Clapeyron.VT_fugacity_coefficient(model, 1 / density_value, t, [1.])[1]
+        end
+    end
+    #println("Rho_sat_liq_CES=  $(Rho_sat_liq_CES)")
+    #println("Rho_sat_vap_CES = $(Rho_sat_vap_CES)")
+
+    pv_CES, Rho_sat_liq_CES, Rho_sat_vap_CES = neighbor_filler(Tsat, Rho_sat_liq_CES, Rho_sat_vap_CES, pv_CES, model)
+    Rho_sat_liq_CES,Rho_sat_vap_CES,Phi_sat_liq_CES,Phi_sat_vap_CES,Sres_sat_liq_CES,Sres_sat_vap_CES,Hv_CES,pv_CES,P_fit,liq, vap = fitter_filler(model,Tsat,Rho_sat_liq_CES,Rho_sat_vap_CES,Phi_sat_liq_CES,Phi_sat_vap_CES,Sres_sat_liq_CES,Sres_sat_vap_CES,Hv_CES,pv_CES,Vc,Tc, Pc, CES, compound)
+    #println("number = $(np.sum(np.isnan(Rho_CES)))")
+    if np.sum(np.isnan(Rho_CES))>3
+        Rho_CES, Sres_CES, Phi_CES = interpolator_filler(Rho_CES,T, P,pv_CES,Tc, Pc, Tsat,CES, compound,model,Sres_CES,Phi_CES )
+    end
     mat_dir = joinpath(Master_folder, "NPZ_files", CES, "$(CES)_$(compound)")
     ensure_directory_exists(mat_dir)
-    matwrite(joinpath(mat_dir, "$(CES) $compound density.mat"), Dict("Rho_CES" => Rho_CES, "Rho_sat_liq" => Rho_sat_liq_CES, "Rho_sat_vap" => Rho_sat_vap_CES))
-    matwrite(joinpath(mat_dir, "$(CES) $compound residual entropy.mat"), Dict("Sres_CES" => Sres_CES, "Sres_sat_liq_CES" => Sres_sat_liq_CES, "Sres_sat_vap_CES" => Sres_sat_vap_CES))
-    matwrite(joinpath(mat_dir, "$(CES) $compound fugacity coefficient.mat"), Dict("Phi_CES" => Phi_CES, "Phi_sat_liq_CES" => Phi_sat_liq_CES, "Phi_sat_vap_CES" => Phi_sat_vap_CES))
-    matwrite(joinpath(mat_dir, "$(CES) $compound Hv.mat"), Dict("Hv_CES" => Hv_CES))
-    matwrite(joinpath(mat_dir, "$(CES) $compound pv.mat"), Dict("pv_CES" => pv_CES))
+    matwrite(joinpath(mat_dir, "$(CES) $compound density.mat"), Dict("Rho_CES" => Rho_CES, "Rho_sat_liq" => Rho_sat_liq_CES, "Rho_sat_vap" => Rho_sat_vap_CES,"T" =>T,"P" =>P,"Tc" =>Tc,"Pc" => Pc,"Vc" => Vc,"T_shift" =>T_shift))
+    matwrite(joinpath(mat_dir, "$(CES) $compound residual entropy.mat"), Dict("Sres_CES" => Sres_CES, "Sres_sat_liq_CES" => Sres_sat_liq_CES, "Sres_sat_vap_CES" => Sres_sat_vap_CES,"T" =>T,"P" =>P,"Tc" =>Tc,"Pc" => Pc,"Vc" => Vc,"T_shift" =>T_shift))
+    matwrite(joinpath(mat_dir, "$(CES) $compound fugacity coefficient.mat"), Dict("Phi_CES" => Phi_CES, "Phi_sat_liq_CES" => Phi_sat_liq_CES, "Phi_sat_vap_CES" => Phi_sat_vap_CES,"T" =>T,"P" =>P,"Tc" =>Tc,"Pc" => Pc,"Vc" => Vc,"T_shift" =>T_shift))
+    matwrite(joinpath(mat_dir, "$(CES) $compound Hv.mat"), Dict("Hv_CES" => Hv_CES,"Tsat" =>Tsat,"T_shift" =>T_shift))
+    matwrite(joinpath(mat_dir, "$(CES) $compound pv.mat"), Dict("pv_CES" => pv_CES,"Tsat" =>Tsat,"T_shift" =>T_shift))
     
-    return T, P, Rho_CES, Sres_CES, Hv_CES, pv_CES, Rho_sat_liq_CES, Rho_sat_vap_CES, Sres_sat_liq_CES, Sres_sat_vap_CES, Phi_CES, Phi_sat_liq_CES, Phi_sat_vap_CES, Tsat
+    return T, P, Rho_CES, Sres_CES, Hv_CES, pv_CES, Rho_sat_liq_CES, Rho_sat_vap_CES, Sres_sat_liq_CES, Sres_sat_vap_CES, Phi_CES, Phi_sat_liq_CES, Phi_sat_vap_CES, Tsat, Tc, Pc
 end
 
 function density_CP(compound; T_shift = 0.0)
@@ -471,47 +638,13 @@ function density_CP(compound; T_shift = 0.0)
 
     handle = CoolProp.AbstractState("HEOS", compound)
 
-    pc = CoolProp.AbstractState.p_critical(handle)
-    Tmax = CoolProp.AbstractState.Tmax(handle)
-
-    handle.update(CoolProp.QT_INPUTS, 0, CoolProp.AbstractState.Tmin(handle))
-
-    pmin = handle.p()
-    pmax = CoolProp.AbstractState.pmax(handle)
-
-    if pmin == handle.p()
-        Tmin = CoolProp.AbstractState.Tmin(handle) + T_shift
-    else
-        try
-            handle.update(CoolProp.PQ_INPUTS, pmin * 100, 1)
-            Tmin = max(CoolProp.AbstractState.Tmin(handle), handle.T() - 50) + T_shift
-        catch
-            Tmin = CoolProp.AbstractState.Tmin(handle) + T_shift
-        end
-    end
-
+    T,P = limit_creator(handle,point_distribution,N,T_shift)
     Tc = CoolProp.AbstractState.T_critical(handle)
+    Pc = CoolProp.AbstractState.p_critical(handle)
 
-    T = collect(LinRange(Tmin, Tmax, N))
-    Tsat = [t for t in T if t < Tc]
+    Tsat = T[T .< Tc] 
 
-    if point_distribution=="linear"
-        P = collect(LinRange(pmin, pmax, N))
-    elseif point_distribution=="log"
-        P = exp10.(LinRange(log10(pmin), log10(pmax), N))
-    end
-
-    Rho_CP = zeros(Float64, length(T), length(P))
-    Phi_CP = zeros(Float64, length(T), length(P))
-    Sres_CP = zeros(Float64, length(T), length(P))
-    Rho_sat_liq_CP = zeros(length(Tsat))
-    Phi_sat_liq_CP = zeros(length(Tsat))
-    Sres_sat_liq_CP = zeros(length(Tsat))
-    Rho_sat_vap_CP = zeros(length(Tsat))
-    Phi_sat_vap_CP = zeros(length(Tsat))
-    Sres_sat_vap_CP = zeros(length(Tsat))
-    pv_CP = zeros(length(Tsat))
-    Hv_CP = zeros(length(Tsat))
+    Rho_CP, Phi_CP, Sres_CP, Rho_sat_liq_CP, Phi_sat_liq_CP, Sres_sat_liq_CP, Rho_sat_vap_CP, Phi_sat_vap_CP, Sres_sat_vap_CP, pv_CP, Hv_CP = zeros(Float64, length(T), length(P)), zeros(Float64, length(T), length(P)), zeros(Float64, length(T), length(P)), zeros(length(Tsat)), zeros(length(Tsat)), zeros(length(Tsat)), zeros(length(Tsat)), zeros(length(Tsat)), zeros(length(Tsat)), zeros(length(Tsat)), zeros(length(Tsat))
 
     for t in T
         if t in Tsat
@@ -540,47 +673,41 @@ function density_CP(compound; T_shift = 0.0)
 
     mat_dir = joinpath(Master_folder, "NPZ_files", "CoolProp", "CoolProp_$(compound)")
     ensure_directory_exists(mat_dir)
+    #print(Rho_sat_liq_CP)
 
-    matwrite(joinpath(mat_dir, "Coolprop $compound density.mat"), Dict("Rho_CP" => Rho_CP, "Rho_sat_liq" => Rho_sat_liq_CP, "Rho_sat_vap" => Rho_sat_vap_CP, "T" => T, "P" => P))
-    matwrite(joinpath(mat_dir, "Coolprop $compound residual entropy.mat"), Dict("Sres_CP" => Sres_CP, "Sres_sat_liq_CP" => Sres_sat_liq_CP, "Sres_sat_vap_CP" => Sres_sat_vap_CP, "T" => T, "P" => P))
-    matwrite(joinpath(mat_dir, "Coolprop $compound fugacity coefficient.mat"), Dict("Phi_CP" => Phi_CP, "Phi_sat_liq_CP" => Phi_sat_liq_CP, "Phi_sat_vap_CP" => Phi_sat_vap_CP, "T" => T, "P" => P))
-    matwrite(joinpath(mat_dir, "Coolprop $compound Hv.mat"), Dict("Hv_CP" => Hv_CP, "Tsat" => Tsat))
-    matwrite(joinpath(mat_dir, "Coolprop $compound pv.mat"), Dict("pv_CP" => pv_CP, "Tsat" => Tsat))
+    matwrite(joinpath(mat_dir, "Coolprop $compound density.mat"), Dict("Rho_CP" => Rho_CP, "Rho_sat_liq" => Rho_sat_liq_CP, "Rho_sat_vap" => Rho_sat_vap_CP, "T" => T, "P" => P,"Tc" =>Tc,"Pc" => Pc,"T_shift" =>T_shift,"Tc" => Tc, "Pc" => Pc))
+    matwrite(joinpath(mat_dir, "Coolprop $compound residual entropy.mat"), Dict("Sres_CP" => Sres_CP, "Sres_sat_liq_CP" => Sres_sat_liq_CP, "Sres_sat_vap_CP" => Sres_sat_vap_CP, "T" => T, "P" => P,"Tc" =>Tc,"Pc" => Pc,"T_shift" =>T_shift,"Tc" => Tc, "Pc" => Pc))
+    matwrite(joinpath(mat_dir, "Coolprop $compound fugacity coefficient.mat"), Dict("Phi_CP" => Phi_CP, "Phi_sat_liq_CP" => Phi_sat_liq_CP, "Phi_sat_vap_CP" => Phi_sat_vap_CP, "T" => T, "P" => P,"Tc" =>Tc,"Pc" => Pc,"T_shift" =>T_shift,"Tc" => Tc, "Pc" => Pc))
+    matwrite(joinpath(mat_dir, "Coolprop $compound Hv.mat"), Dict("Hv_CP" => Hv_CP, "Tsat" => Tsat,"T_shift" =>T_shift,"Tc" => Tc, "Pc" => Pc))
+    matwrite(joinpath(mat_dir, "Coolprop $compound pv.mat"), Dict("pv_CP" => pv_CP, "Tsat" => Tsat,"T_shift" =>T_shift,"Tc" => Tc, "Pc" => Pc))
     
-    return T, P, Rho_CP, Sres_CP, Hv_CP, pv_CP, Rho_sat_liq_CP, Rho_sat_vap_CP, Sres_sat_liq_CP, Sres_sat_vap_CP, Phi_CP, Phi_sat_liq_CP, Phi_sat_vap_CP, Tsat
+    return T, P, Rho_CP, Sres_CP, Hv_CP, pv_CP, Rho_sat_liq_CP, Rho_sat_vap_CP, Sres_sat_liq_CP, Sres_sat_vap_CP, Phi_CP, Phi_sat_liq_CP, Phi_sat_vap_CP, Tsat, Tc, Pc
 end
 
-function graph(CES, Name, subs, eos_data, exp_data, sat_liq_exp, sat_vap_exp, sat_liq_eos, sat_vap_eos, vp, T, P)
+
+function graph_(CES, Name, subs, eos_data, exp_data, sat_liq_exp, sat_vap_exp,
+               sat_liq_eos, sat_vap_eos, vp_cool, vp_eos, Tsat_cool, Tsat_eos,
+               Tc_cool, Tc_eos, Pc_cool, Pc_eos, T, P)
+
+    eos_style = ":"
+    coo_style = "-"
+    eos_color = "k"
+    coo_color = "k"
+    P_fit = fit_vapor_pressure(Tc_eos, Pc_eos, Tsat_eos, sat_vap_eos, CES, Name; print_AAD=false, plot=false)
     mat_dir = joinpath(Master_folder, "Figures", CES, "$(CES)_$(subs)")
     ensure_directory_exists(mat_dir)
-
-    handle = CoolProp.AbstractState("HEOS", subs)
-    pc = handle.p_critical()
-    Tc = handle.T_critical()
 
     Tmin = minimum(T)
     Pmin = minimum(P)
 
-    function lowest_T(temperature)
-        return sat_prop(handle, temperature, "p", 1) - Pmin
-    end
-
+    handle = CoolProp.AbstractState("HEOS", subs)
+    lowest_T(temperature) = sat_prop(handle, temperature, "p", 1) - Pmin
     try
-        Tlow = scipy.optimize.fsolve(lowest_T, (Tc + Tmin) / 2)[1]
+        Tlow = scipy.optimize.fsolve(lowest_T, (Tc_cool + Tmin) / 2)[1]
     catch
         Tlow = Tmin
     end
-
-    Tsat = [T[i] for (i, pv) in enumerate(vp)]
-    indexes = round.(Int, range(1, length(Tsat), length = 50))
-
-    Tsam = Tsat[indexes]
-    Vpsam = vp[indexes]
-
-    Error = (abs.(eos_data .- exp_data) .* 100 ./ abs.(exp_data))
-    errors_liq = abs.(sat_liq_exp[indexes] .- sat_liq_eos[indexes]) ./ sat_liq_exp[indexes]
-    errors_vap = abs.(sat_vap_exp[indexes] .- sat_vap_eos[indexes]) ./ sat_vap_exp[indexes]
-    errors = (errors_liq .+ errors_vap) ./ 2
+    Plin, Tlin = P, T
     P, T = np.meshgrid(P, T)
 
     levels = LinRange(0, 30, 11)
@@ -591,43 +718,138 @@ function graph(CES, Name, subs, eos_data, exp_data, sat_liq_exp, sat_vap_exp, sa
     plt.figure(2^3)
     plt.title("$(CES) $(Name) error for $(subs)")
     plt.yscale("log")
-    contour = plt.contourf(T ./ Tc, P ./ pc, Error, levels = levels, cmap = cmap, extend = "max")
+    Error = (abs.(eos_data .- exp_data) .* 100 ./ abs.(exp_data))
+    contour = plt.contourf(T ./ Tc_cool, P ./ Pc_cool, Error, levels = levels, cmap = cmap, extend = "max")
     plt.colorbar(contour, label = "Error (%)")
     plt.grid()
     plt.xlabel("\$T_{r}\$ [-]")
     plt.ylabel("\$P_{r}\$ [-]")
-    plt.axvline(x = 1, linestyle = "--", linewidth = 3, color = "k")
-    plt.axhline(y = 1, linestyle = "--", linewidth = 3, color = "k")
-
     plt.gca()[:set_ylim](bottom = 0.01)
-    plt.plot(Tsat./ Tc, vp ./ pc, linestyle = "-", linewidth = 3, color = "k")
+    
 
-    scatter_colors = cmap[:__call__](norm(errors))
-    plt.scatter(Tsam./ Tc, Vpsam ./ pc, c = scatter_colors, edgecolor = "black", s = 50, zorder = 2)
+    if Tc_cool > Tc_eos
+        Tsat = Tsat_eos
+        sat_liq_exp = sat_liq_exp[Tsat_cool .<= Tc_eos]
+        sat_vap_exp = sat_vap_exp[Tsat_cool .<= Tc_eos]
+        errors_liq = abs.(sat_liq_exp .- sat_liq_eos) ./ sat_liq_exp
+        errors_vap = abs.(sat_vap_exp .- sat_vap_eos) ./ sat_vap_exp
+        errors = (errors_liq .+ errors_vap) ./ 2
+        Tsam = Tsat
+        Vpsam = vp_eos
 
-    plt.savefig(joinpath(mat_dir, "$(CES) $(Name) $(subs) big.png"))
+
+
+        plt.fill_between(Tsat_eos ./ Tc_cool, vp_eos ./ Pc_cool, vp_cool[Tsat_cool .<= Tc_eos] ./ Pc_cool, color="w")
+        plt.plot(Tsat_cool ./ Tc_cool, vp_cool ./ Pc_cool, linestyle = coo_style, linewidth = 1.5, color = coo_color)
+
+    elseif Tc_cool < Tc_eos
+        Tsat = Tsat_cool
+        sat_liq_eos = sat_liq_eos[Tsat_eos .<= Tc_cool]
+        sat_vap_eos = sat_vap_eos[Tsat_eos .<= Tc_cool]
+        errors_liq = abs.(sat_liq_exp .- sat_liq_eos) ./ sat_liq_exp
+        errors_vap = abs.(sat_vap_exp .- sat_vap_eos) ./ sat_vap_exp
+        errors = (errors_liq .+ errors_vap) ./ 2
+        Tsam = Tsat
+        Vpsam = vp_cool
+
+        # Interpolate vp_cool to match Tsat_eos
+        println(Tsat_cool, Tc_cool, vp_cool , Pc_cool)
+        plt.fill_between(Tsat_cool ./ Tc_cool, vp_cool ./ Pc_cool, vp_eos[Tsat_eos .<= Tc_cool] ./ Pc_cool, color="white", zorder=0)
+        plt.plot(Tsat_eos ./ Tc_cool, vp_eos ./ Pc_cool, linestyle = eos_style, linewidth = 1.5, color = eos_color)
+
+    else
+        Tsat = Tsat_cool
+        errors_liq = abs.(sat_liq_exp .- sat_liq_eos) ./ sat_liq_exp
+        errors_vap = abs.(sat_vap_exp .- sat_vap_eos) ./ sat_vap_exp
+        errors = (errors_liq .+ errors_vap) ./ 2
+        Tsam = Tsat
+        Vpsam = vp_cool
+        plt.plot(Tsat_eos ./ Tc_cool, vp_eos ./ Pc_cool, linestyle = eos_style, linewidth = 1.5, color = eos_color)
+    end
+    plt.axvline(x = 1, linestyle = coo_style, linewidth = 1.5, color = coo_color)
+    plt.axhline(y = 1, linestyle = coo_style, linewidth = 1.5, color = coo_color)
+    plt.axvline(x = Tc_eos/Tc_cool, linestyle = eos_style, linewidth = 1.5, color = eos_color)
+    plt.axhline(y = Pc_eos/Pc_cool, linestyle = eos_style, linewidth = 1.5, color = eos_color)
+    
+    norm = colors.BoundaryNorm(np.array(levels), cmap.N)
+
+    for i in 1:length(Tsam)-1
+        x = [Tsam[i]/Tc_cool, Tsam[i+1]/Tc_cool]
+        y = [Vpsam[i]/Pc_cool, Vpsam[i+1]/Pc_cool]
+        color_value = errors[i]
+        color = cmap(norm(color_value))
+        plt.plot(x, y, color=color, linewidth=1.5)
+    end
+
+    plt.savefig(joinpath(mat_dir, "$(CES) $(Name) $(subs) big.png"), dpi=600)
     plt.close()
 
     plt.figure(3^7)
     plt.title("$(CES) $(Name) error for $(subs)")
     plt.yscale("log")
-    contour = plt.contourf((T ./ Tc), (P ./ pc), Error, levels=levels, cmap=cmap, extend="max")
+    contour = plt.contourf((T ./ Tc_cool), (P ./ Pc_cool), Error, levels=levels, cmap=cmap, extend="max")
     plt.colorbar(contour, label = "Error (%)")
     plt.grid()
     plt.xlabel("\$T_{r}\$ [-]")
     plt.ylabel("\$P_{r}\$ [-]")
-
-    plt.axvline(x = 1, linestyle = "--", linewidth = 3, color = "k")
-    plt.axhline(y = 1, linestyle = "--", linewidth = 3, color = "k")
-
     plt.gca()[:set_ylim](bottom = 0.01)
-    plt.plot([T[i] for (i, pv) in enumerate(vp)]./ Tc, vp./ pc, linestyle = "-", linewidth = 3, color = "k")
 
-    plt.scatter(Tsam./ Tc, Vpsam./ pc, c = scatter_colors, edgecolor = "black", s = 50, zorder = 2)
+    if Tc_cool > Tc_eos
+        plt.plot(Tsat_cool ./ Tc_cool, vp_cool ./ Pc_cool, linestyle = coo_style, linewidth = 1.5, color = coo_color)
+        plt.fill_between(Tsat_eos ./ Tc_cool, vp_eos ./ Pc_cool, vp_cool[Tsat_cool .<= Tc_eos] ./ Pc_cool, color="w")
 
-    plt.xlim(Tmin / Tc, 2 * (Tc - Tmin) / Tc)
-    plt.savefig(joinpath(mat_dir, "$(CES) $(Name) $(subs) small.png"))
+    elseif Tc_cool < Tc_eos
+        plt.fill_between(Tsat_cool ./ Tc_cool, vp_cool ./ Pc_cool, vp_eos[Tsat_eos .<= Tc_cool] ./ Pc_cool, color="white")
+        plt.plot(Tsat_eos ./ Tc_cool, vp_eos ./ Pc_cool, linestyle = eos_style, linewidth = 1.5, color = eos_color)
+        
+    else
+        plt.plot(Tsat_eos ./ Tc_cool, vp_eos ./ Pc_cool, linestyle = eos_style, linewidth = 1.5, color = eos_color)
+    end
+
+    norm = colors.BoundaryNorm(np.array(levels), cmap.N)
+    plt.axvline(x = 1, linestyle = coo_style, linewidth = 1.5, color = coo_color)
+    plt.axhline(y = 1, linestyle = coo_style, linewidth = 1.5, color = coo_color)
+    plt.axvline(x = Tc_eos/Tc_cool, linestyle = eos_style, linewidth = 1.5, color = eos_color)
+    plt.axhline(y = Pc_eos/Pc_cool, linestyle = eos_style, linewidth = 1.5, color = eos_color)
+    
+    
+    for i in 1:length(Tsam)-1
+        x = [Tsam[i]/Tc_cool, Tsam[i+1]/Tc_cool]
+        y = [Vpsam[i]/Pc_cool, Vpsam[i+1]/Pc_cool]
+        color_value = errors[i]
+        color = cmap(norm(color_value))
+        plt.plot(x, y, color=color, linewidth=1.5)
+    end
+
+    plt.xlim(Tmin / Tc_cool, 2 * (Tc_cool - Tmin) / Tc_cool)
+    plt.savefig(joinpath(mat_dir, "$(CES) $(Name) $(subs) small.png"), dpi=600)
     plt.close()
+
+    
+    #plt.title("$(CES) $(Name) vs Temperature at Constant Pressures for $(subs)")
+    #plt.xlabel("Temperature [K]")
+    #plt.ylabel("$(Name)")
+    """plt.grid()
+    indices = round.(Int, range(1, 500, length=15))
+
+    plt.axvline(x = Tc_eos, linestyle = eos_style, linewidth = 1.5, color = eos_color)
+    plt.axvline(x = Tc_cool, linestyle = coo_style, linewidth = 1.5, color = coo_color)
+    int_data = interpolator(eos_data, Tlin, Plin,vp_eos , Tc_eos, Pc_eos , Tsat_eos,P_fit,method="nearest")
+    error_ = (eos_data-int_data)*100/eos_data
+
+    for i in indices
+        Isobars = error_[:,i]
+        if Plin[i]<=Pc_eos
+    """
+    #        plt.plot(Tlin, Isobars, label="$(Plin[i])",color="b")
+    #    elseif Plin[i]>Pc_eos
+    #        plt.plot(Tlin, Isobars, label="$(Plin[i])",color="r")
+    #    end
+    #end
+    #plt.legend()
+    #plt.savefig(joinpath(mat_dir, "$(CES) $(subs) $(Name)vs_T.png"), dpi=600)
+    #plt.close()
+    
 end
 
 CESs = ["cPR","ADPCSAFT", "BACKSAFT", "Berthelot", "CKSAFT", "Clausius", "CPA", "CPPCSAFT", "PR","DAPT", "EPPR78", "GEPCSAFT" , "GEPCSAFT" , "HeterogcPCPSAFT", "HomogcPCPSAFT", "iPCSAFT", "KU", "LJSAFT","ogSAFT", "PatelTeja", "PCPSAFT", "PCSAFT", "pharmaPCSAFT", "PR78","PSRK", "PTV", "QCPR", "OPCSAFT", "RK", "RKPR","SAFTgammaMie","SAFTVRMie", "SAFTVRMie15", "SAFTVRQMie", "SAFTVRSMie", "SAFTVRSW", "sCKSAFT","sCPA", "softSAFT2016","sPCSAFT", "SRK", "structSAFTgammaMie", "tcPR", "tcRK", "TVTPR", "gcsPCSAFT","TWUSRK", "UMRPR", "vdW", "VTPR"] 
@@ -635,9 +857,14 @@ CESs = ["cPR","ADPCSAFT", "BACKSAFT", "Berthelot", "CKSAFT", "Clausius", "CPA", 
 
 compounds = ["n-Nonane", "MethylLinolenate", "DimethylCarbonate", "R21", "DiethylEther", "trans-2-Butene", "R245fa", "ParaDeuterium", "OrthoDeuterium", "Isohexane", "R365MFC", "n-Dodecane", "R410A", "Deuterium", "D4", "R13", "MD2M", "n-Hexane", "Methane", "Ethane", "CarbonylSulfide", "EthylBenzene", "CarbonMonoxide", "Isopentane", "Xenon", "cis-2-Butene", "R152A", "Oxygen", "EthyleneOxide", "R1234ze(E)", "n-Octane", "R404A", "R236EA", "CycloHexane", "n-Heptane", "R22", "R113", "n-Pentane", "MethylLinoleate", "R11", "SulfurDioxide", "R23", "Helium", "R32", "R227EA", "R407C", "HydrogenSulfide", "Air", "R245ca", "Novec649", "R143a", "D5", "R507A", "R134a", "Dichloroethane", "ParaHydrogen", "R1233zd(E)", "Acetone", "n-Decane", "HeavyWater", "MethylPalmitate", "n-Propane", "R115", "R1234yf", "R236FA", "Ethylene", "R116", "MD4M", "Benzene", "Methanol", "SulfurHexafluoride", "o-Xylene", "R125", "Fluorine", "R1234ze(Z)", "CarbonDioxide", "IsoButane", "n-Butane", "NitrousOxide", "DimethylEther", "RC318", "Toluene", "IsoButene", "MethylStearate", "Ammonia", "Argon", "R218", "R41", "Neon", "Propyne", "CycloPropane", "R12", "Nitrogen", "Water", "MethylOleate", "R161", "D6", "SES36", "HFE143m", "n-Undecane", "R123", "HydrogenChloride", "m-Xylene", "R141b", "R124", "1-Butene", "Propylene", "R14", "p-Xylene", "Cyclopentane", "MDM", "Hydrogen", "Neopentane", "Ethanol", "OrthoHydrogen", "R114", "Krypton", "MD3M", "R1243zf", "MM", "R142b", "R40", "R13I1"]
 
-function process_comp(comp,EOS)
 
-    T, P, Rho_CES, Sres_CES, Hv_CES, pv_CES, Rho_sat_liq_CES, Rho_sat_vap_CES, Sres_sat_liq_CES, Sres_sat_vap_CES, Phi_CES, Phi_sat_liq_CES, Phi_sat_vap_CES, Tsat = density_CES(comp, EOS; T_shift = 10)
+function graph(args...; kwargs...)
+    graph_(args...; kwargs...)
+end
+
+
+
+function process_comp(comp,EOS)
 
     for compound in [comp]
   
@@ -645,18 +872,39 @@ function process_comp(comp,EOS)
         T_shift = 0.0
         failed_loading = false
     
-        mat_data_cp = nothing
-        mat_data_ces = nothing
+        mat_dir_cool = joinpath(Master_folder, "NPZ_files", "CoolProp", "CoolProp_$(comp)")
+        mat_dir_eos = joinpath(Master_folder, "NPZ_files", EOS, "$(EOS)_$(comp)")
+        # <-- lines that were missing -->
+        cp_files = [
+            joinpath(mat_dir_cool, "Coolprop $compound density.mat"),
+            joinpath(mat_dir_cool, "Coolprop $compound residual entropy.mat"),
+            joinpath(mat_dir_cool, "Coolprop $compound fugacity coefficient.mat"),
+            joinpath(mat_dir_cool, "Coolprop $compound Hv.mat"),
+            joinpath(mat_dir_cool, "Coolprop $compound pv.mat")
+        ]
+        mat_data_cp = all(isfile, cp_files) ? [matread(f) for f in cp_files] : nothing
+
+        ces_files = [
+            joinpath(mat_dir_eos, "$(EOS) $compound density.mat"),
+            joinpath(mat_dir_eos, "$(EOS) $compound residual entropy.mat"),
+            joinpath(mat_dir_eos, "$(EOS) $compound fugacity coefficient.mat"),
+            joinpath(mat_dir_eos, "$(EOS) $compound Hv.mat"),
+            joinpath(mat_dir_eos, "$(EOS) $compound pv.mat")
+        ]
+        mat_data_ces = all(isfile, ces_files) ? [matread(f) for f in ces_files] : nothing
+
 
         T, P, Tsat = nothing, nothing, nothing
-        Rho_CP, Sres_CP, Hv_CP, pv_CP, Rho_sat_liq_CP, Rho_sat_vap_CP, Sres_sat_liq_CP, Sres_sat_vap_CP, Phi_CP, Phi_sat_liq_CP, Phi_sat_vap_CP = nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing
+        Rho_CP, Sres_CP, Hv_CP, pv_CP, Rho_sat_liq_CP, Rho_sat_vap_CP, Sres_sat_liq_CP, Sres_sat_vap_CP, Phi_CP, Phi_sat_liq_CP, Phi_sat_vap_CP, Tsat_cool, Tc_cool, Pc_cool = nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing
         Rho_CES, Sres_CES, Hv_CES, pv_CES, Rho_sat_liq_CES, Rho_sat_vap_CES, Sres_sat_liq_CES, Sres_sat_vap_CES, Phi_CES, Phi_sat_liq_CES, Phi_sat_vap_CES = nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing
-
+        
+        #print("mat_data_cp = ",mat_data_cp)
         if mat_data_cp === nothing
             fail = true
+            print("we are here")
             while fail
                 try
-                    T, P, Rho_CP, Sres_CP, Hv_CP, pv_CP, Rho_sat_liq_CP, Rho_sat_vap_CP, Sres_sat_liq_CP, Sres_sat_vap_CP, Phi_CP, Phi_sat_liq_CP, Phi_sat_vap_CP = density_CP(compound; T_shift = T_shift)
+                    T, P, Rho_CP, Sres_CP, Hv_CP, pv_CP, Rho_sat_liq_CP, Rho_sat_vap_CP, Sres_sat_liq_CP, Sres_sat_vap_CP, Phi_CP, Phi_sat_liq_CP, Phi_sat_vap_CP, Tsat_cool, Tc_cool, Pc_cool = density_CP(compound; T_shift = T_shift)
                     fail = false
                 catch
                     T_shift += 1
@@ -674,21 +922,21 @@ function process_comp(comp,EOS)
             Phi_CP = mat_data_cp[3]["Phi_CP"]
             Phi_sat_liq_CP = mat_data_cp[3]["Phi_sat_liq_CP"]
             Phi_sat_vap_CP = mat_data_cp[3]["Phi_sat_vap_CP"]
-            Tsat = mat_data_cp[4]["Tsat"]
+            Tsat_cool = mat_data_cp[4]["Tsat"]
+            T_shift = mat_data_cp[4]["T_shift"]
+            Tc_cool = mat_data_cp[1]["Tc"]
+            Pc_cool = mat_data_cp[1]["Pc"]
+            println(T_shift)
+
+
+
+
         end
 
         if mat_data_ces === nothing
             try
-                T, P, Rho_CES, Sres_CES, Hv_CES, pv_CES, Rho_sat_liq_CES, Rho_sat_vap_CES, Sres_sat_liq_CES, Sres_sat_vap_CES, Phi_CES, Phi_sat_liq_CES, Phi_sat_vap_CES, Tsat = density_CES(compound, ces; T_shift = T_shift)
-
-                println("Rho_sat_liq_CES = ",Rho_sat_liq_CES )
-                println("Rho_sat_vap_CES = ",Rho_sat_vap_CES)
-                println("Hv_CES = ",Hv_CES)
-                println("pv_CES = ",pv_CES)
-
-
+                T, P, Rho_CES, Sres_CES, Hv_CES, pv_CES, Rho_sat_liq_CES, Rho_sat_vap_CES, Sres_sat_liq_CES, Sres_sat_vap_CES, Phi_CES, Phi_sat_liq_CES, Phi_sat_vap_CES, Tsat_ces, Tc_ces, Pc_ces  = density_CES(compound, ces; T_shift = T_shift)
             catch e
-                println("Failed for CES $ces on $compound")
                 println(e)
                 failed_loading = true
             end
@@ -704,38 +952,76 @@ function process_comp(comp,EOS)
             Phi_CES = mat_data_ces[3]["Phi_CES"]
             Phi_sat_liq_CES = mat_data_ces[3]["Phi_sat_liq_CES"]
             Phi_sat_vap_CES = mat_data_ces[3]["Phi_sat_vap_CES"]
+            Tsat_ces = mat_data_ces[4]["Tsat"]
+            Tc_ces = mat_data_ces[1]["Tc"]
+            Pc_ces = mat_data_ces[1]["Pc"]
+
         end
 
         if !failed_loading
             mat_dir = joinpath(Master_folder, "Figures", EOS, "$(EOS)_$(comp)")
             ensure_directory_exists(mat_dir)
-        
-            graph(EOS, "Residual molar entropy", compound, Sres_CES, Sres_CP, Sres_sat_liq_CP, Sres_sat_vap_CP, Sres_sat_liq_CES, Sres_sat_vap_CES, pv_CP, T, P)
 
-            graph(EOS, "Density", compound, Rho_CES, Rho_CP, Rho_sat_liq_CP, Rho_sat_vap_CP, Rho_sat_liq_CES, Rho_sat_vap_CES, pv_CP, T, P)
 
-            graph(EOS, "Fugacity Coefficient", compound, Phi_CES, Phi_CP, Phi_sat_liq_CP, Phi_sat_vap_CP, Phi_sat_liq_CES, Phi_sat_vap_CES, pv_CP, T, P)
+            graph(EOS, "Residual molar entropy", compound, Sres_CES, Sres_CP, Sres_sat_liq_CP, Sres_sat_vap_CP, Sres_sat_liq_CES, Sres_sat_vap_CES,  pv_CP,pv_CES,Tsat_cool,Tsat_ces,Tc_cool,Tc_ces,Pc_cool,Pc_ces, T, P)
 
-            plt = plot(Tsat, abs.(pv_CP .- pv_CES) .* 100 ./ pv_CP, xlabel = "Temperature [K]", ylabel = "Pressure Error", title = "Vapor Pressure $compound", xlims = (minimum(Tsat), maximum(Tsat)))
+            graph(EOS, "Density", compound, Rho_CES, Rho_CP, Rho_sat_liq_CP, Rho_sat_vap_CP, Rho_sat_liq_CES, Rho_sat_vap_CES, pv_CP,pv_CES,Tsat_cool,Tsat_ces,Tc_cool,Tc_ces,Pc_cool,Pc_ces, T, P)
+
+            graph(EOS, "Fugacity Coefficient", compound, Phi_CES, Phi_CP, Phi_sat_liq_CP, Phi_sat_vap_CP, Phi_sat_liq_CES, Phi_sat_vap_CES, pv_CP,pv_CES,Tsat_cool,Tsat_ces,Tc_cool,Tc_ces,Pc_cool,Pc_ces, T, P)
+            
+            if Tc_ces > Tc_cool
+                Tsat = Tsat_cool
+                pv_EXP = pv_CP
+                pv_EOS = pv_CES[Tsat_ces .<Tc_cool]
+                Hv_EXP = Hv_CP
+                Hv_EOS = Hv_CES[Tsat_ces .<Tc_cool]
+
+            elseif Tc_ces < Tc_cool
+                Tsat = Tsat_ces
+                pv_EXP = pv_CP[Tsat_cool .<=Tc_ces]
+                pv_EOS = pv_CES
+                Hv_EXP = Hv_CP[Tsat_cool .<=Tc_ces]
+                Hv_EOS = Hv_CES
+
+            elseif Tc_ces == Tc_cool
+                Tsat = Tsat_cool
+                pv_EXP = pv_CP
+                pv_EOS = pv_CES
+                Hv_EXP = Hv_CP
+                Hv_EOS = Hv_CES
+            end
+            plt = plot(Tsat, abs.(pv_EXP .- pv_EOS) .* 100 ./ pv_EXP, xlabel = "Temperature [K]", ylabel = "Pressure Error", title = "Vapor Pressure $compound", xlims = (minimum(Tsat), maximum(Tsat)))
             savefig(plt, joinpath(mat_dir, "Vapor Pressure $(EOS) $compound.png"))
         
-            plt = plot(Tsat, abs.(Hv_CP .- Hv_CES) .* 100 ./ Hv_CP, xlabel = "Temperature [K]", ylabel = "Enthalpy Error", title = "Enthalpy $compound", xlims = (minimum(Tsat), maximum(Tsat)))
+            plt = plot(Tsat, abs.(Hv_EXP .- Hv_EOS) .* 100 ./ Hv_EXP, xlabel = "Temperature [K]", ylabel = "Enthalpy Error", title = "Enthalpy $compound", xlims = (minimum(Tsat), maximum(Tsat)))
             savefig(plt, joinpath(mat_dir, "Enthalpy $(EOS) $compound.png"))
         end
     end
 end
+
+compounds = ["n-Nonane", "MethylLinolenate", "DimethylCarbonate", "R21", "DiethylEther", "trans-2-Butene", "R245fa", "ParaDeuterium", "OrthoDeuterium", "Isohexane", "R365MFC", "n-Dodecane", "R410A", "Deuterium", "D4", "R13", "MD2M", "n-Hexane", "Methane", "Ethane", "CarbonylSulfide", "EthylBenzene", "CarbonMonoxide", "Isopentane", "Xenon", "cis-2-Butene", "R152A", "Oxygen", "EthyleneOxide", "R1234ze(E)", "n-Octane", "R404A", "R236EA", "CycloHexane", "n-Heptane", "R22", "R113", "n-Pentane", "MethylLinoleate", "R11", "SulfurDioxide", "R23", "Helium", "R32", "R227EA", "R407C", "HydrogenSulfide", "Air", "R245ca", "Novec649", "R143a", "D5", "R507A", "R134a", "Dichloroethane", "ParaHydrogen", "R1233zd(E)", "Acetone", "n-Decane", "HeavyWater", "MethylPalmitate", "n-Propane", "R115", "R1234yf", "R236FA", "Ethylene", "R116", "MD4M", "Benzene", "Methanol", "SulfurHexafluoride", "o-Xylene", "R125", "Fluorine", "R1234ze(Z)", "CarbonDioxide", "IsoButane", "n-Butane", "NitrousOxide", "DimethylEther", "RC318", "Toluene", "IsoButene", "MethylStearate", "Ammonia", "Argon", "R218", "R41", "Neon", "Propyne", "CycloPropane", "R12", "Nitrogen", "Water", "MethylOleate", "R161", "D6", "SES36", "HFE143m", "n-Undecane", "R123", "HydrogenChloride", "m-Xylene", "R141b", "R124", "1-Butene", "Propylene", "R14", "p-Xylene", "Cyclopentane", "MDM", "Hydrogen", "Neopentane", "Ethanol", "OrthoHydrogen", "R114", "Krypton", "MD3M", "R1243zf", "MM", "R142b", "R40", "R13I1"]
+
+
 
 for EOS in [ARGS[2]]
     for subs in [ARGS[1]]
         path = joinpath(Master_folder, "NPZ_files", EOS, "$(EOS)_$(subs)")
         #if !ispath(path)
         if true
+            #model = eval(Meta.parse("$(EOS)([\"$(subs)\"])"))
+            println("$(EOS) with $(subs)")
+            process_comp(subs,EOS)
             try
                 println(path)
                 println("$(EOS) with $(subs)")
                 process_comp(subs,EOS)
-            catch 
-                println("Error")
+            catch e
+                
+                println("Python Error:")
+                showerror(stdout, e)
+                println("\nStacktrace:")
+                display(stacktrace(catch_backtrace()))
+                continue
             end
         end
     end
